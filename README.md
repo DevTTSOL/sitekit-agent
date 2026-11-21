@@ -26,8 +26,12 @@ The agent is automatically installed when you provision a server through the Sit
 
 ```bash
 # Download the agent binary
-curl -sL https://github.com/avansaber/sitekit-agent/releases/latest/download/sentinel-linux-amd64 -o /opt/sitekit/bin/sentinel
-chmod +x /opt/sitekit/bin/sentinel
+VERSION=vX.Y.Z
+RELEASE=https://github.com/DevTTSOL/sitekit-agent/releases/download
+curl -fsSL "$RELEASE/$VERSION/sentinel-linux-amd64" -o /tmp/sentinel-linux-amd64
+curl -fsSL "$RELEASE/$VERSION/SHA256SUMS" -o /tmp/SHA256SUMS
+(cd /tmp && grep ' sentinel-linux-amd64$' SHA256SUMS | sha256sum -c -)
+install -m 755 /tmp/sentinel-linux-amd64 /opt/sitekit/bin/sentinel
 
 # Configure the agent
 cat > /opt/sitekit/agent.yaml << EOF
@@ -47,15 +51,19 @@ systemctl start sitekit-agent
 
 ```bash
 # Clone the repository
-git clone https://github.com/avansaber/sitekit-agent.git
+git clone https://github.com/DevTTSOL/sitekit-agent.git
 cd sitekit-agent
 
-# Build for Linux
-GOOS=linux GOARCH=amd64 go build -o sentinel ./cmd/sentinel
+# Build stripped Linux binaries without build-machine paths
+make build-linux
 
-# Build for macOS
-GOOS=darwin GOARCH=amd64 go build -o sentinel ./cmd/sentinel
+# Build and verify release artifacts and checksums
+make release
 ```
+
+Tagged `v*` pushes run [the release workflow](.github/workflows/release.yml) and
+publish amd64 and arm64 Linux artifacts with a `SHA256SUMS` manifest. Builds use
+`-trimpath`, strip symbols, and reject known build-machine paths.
 
 ## Architecture
 
