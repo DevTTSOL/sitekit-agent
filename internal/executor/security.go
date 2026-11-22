@@ -72,6 +72,24 @@ func openRoot(basePath string) (*os.Root, string, error) {
 	return root, realBase, nil
 }
 
+func openRegularFile(open func() (*os.File, error)) (*os.File, error) {
+	file, err := open()
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("path is not a regular file")
+	}
+	return file, nil
+}
+
 func relativeToRoot(rootPath, path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(rootPath, path)

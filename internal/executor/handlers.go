@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/avansaber/sitekit-agent/internal/comm"
 	"github.com/rs/zerolog/log"
@@ -2168,7 +2169,9 @@ func (e *Executor) handleImportDatabase(ctx context.Context, payload json.RawMes
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	inputFile, err := os.Open(p.FilePath)
+	inputFile, err := openRegularFile(func() (*os.File, error) {
+		return os.OpenFile(p.FilePath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
 	if err != nil {
 		return comm.JobResult{Success: false, Error: "failed to open import file: " + err.Error()}
 	}
@@ -3213,18 +3216,13 @@ func (e *Executor) handleTailLog(ctx context.Context, payload json.RawMessage) c
 	}
 	defer root.Close()
 
-	file, err := root.Open(relative)
+	file, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		if err == nil {
-			err = fmt.Errorf("path is not a regular file")
-		}
-		return comm.JobResult{Success: false, Error: err.Error()}
-	}
 
 	output, err := tailLines(file, lines)
 	return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err)}
@@ -3260,7 +3258,9 @@ func (e *Executor) handleSearchLog(ctx context.Context, payload json.RawMessage)
 	}
 	defer root.Close()
 
-	file, err := root.Open(relative)
+	file, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
@@ -3330,16 +3330,15 @@ func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessag
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
-	input, err := root.Open(relative)
+	input, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 	defer input.Close()
 	info, err := input.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		if err == nil {
-			err = fmt.Errorf("path is not a regular file")
-		}
+	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 

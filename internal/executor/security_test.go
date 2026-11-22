@@ -5,9 +5,28 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestOpenRegularFileRejectsFIFO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pipe")
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := openRegularFile(func() (*os.File, error) {
+		return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
+	if err == nil {
+		file.Close()
+		t.Fatal("FIFO was accepted as a regular file")
+	}
+	if err.Error() != "path is not a regular file" {
+		t.Fatalf("unexpected error for FIFO: %v", err)
+	}
+}
 
 func TestConfinedRootRejectsSymlinkEscape(t *testing.T) {
 	base := t.TempDir()
