@@ -139,7 +139,7 @@ WorkingDirectory=/opt/sitekit
 ExecStart=/opt/sitekit/sentinel
 Restart=always
 RestartSec=5
-UMask=0077
+UMask=0022
 
 [Install]
 WantedBy=multi-user.target
