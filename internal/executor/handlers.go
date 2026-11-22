@@ -1513,7 +1513,7 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	if cloneUrl == "" {
 		cloneUrl = p.Repository
 	}
-	if strings.HasPrefix(cloneUrl, "git@") || strings.HasPrefix(cloneUrl, "ssh://") {
+	if isSSHRemote(cloneUrl) {
 		if p.SSHKnownHosts == "" {
 			knownHosts, err := os.ReadFile(knownHostsPath)
 			if err != nil {
@@ -1741,6 +1741,21 @@ export HOME="$SITEKIT_HOME"
 			"release_path": releaseDir,
 		},
 	}
+}
+
+func isSSHRemote(remote string) bool {
+	if strings.HasPrefix(remote, "ssh://") {
+		return true
+	}
+	if strings.Contains(remote, "://") {
+		return false
+	}
+	colon := strings.IndexByte(remote, ':')
+	if colon <= 0 {
+		return false
+	}
+	slash := strings.IndexByte(remote, '/')
+	return slash == -1 || colon < slash
 }
 
 // Script handler

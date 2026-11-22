@@ -99,6 +99,29 @@ func TestCommandOptionsPassInputWithoutShell(t *testing.T) {
 	}
 }
 
+func TestIsSSHRemote(t *testing.T) {
+	tests := []struct {
+		remote string
+		want   bool
+	}{
+		{"git@github.com:org/repo.git", true},
+		{"deploy@git.example:org/repo.git", true},
+		{"git.example:org/repo.git", true},
+		{"ssh://git.example/org/repo.git", true},
+		{"ssh://deploy@git.example:2222/org/repo.git", true},
+		{"https://git.example/org/repo.git", false},
+		{"git://git.example/org/repo.git", false},
+		{"/srv/git/repo.git", false},
+		{"../repo.git", false},
+		{"./repo:with-colon.git", false},
+	}
+	for _, test := range tests {
+		if got := isSSHRemote(test.remote); got != test.want {
+			t.Errorf("isSSHRemote(%q) = %t, want %t", test.remote, got, test.want)
+		}
+	}
+}
+
 func TestMySQLDefaultsQuoteCredentialsAndRejectNewlines(t *testing.T) {
 	defaults, err := mysqlDefaultsContent(`sitekit`, `pass"\line`)
 	if err != nil {
