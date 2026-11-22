@@ -30,7 +30,7 @@ VERSION=vX.Y.Z
 RELEASE=https://github.com/DevTTSOL/sitekit-agent/releases/download
 curl -fsSL "$RELEASE/$VERSION/sentinel-linux-amd64" -o /tmp/sentinel-linux-amd64
 curl -fsSL "$RELEASE/$VERSION/SHA256SUMS" -o /tmp/SHA256SUMS
-(cd /tmp && grep ' sentinel-linux-amd64$' SHA256SUMS | sha256sum -c -)
+(cd /tmp && grep ' sentinel-linux-amd64$' SHA256SUMS | sha256sum -c -) || { echo "Checksum verification failed" >&2; exit 1; }
 install -m 755 /tmp/sentinel-linux-amd64 /opt/sitekit/bin/sentinel
 
 # Configure the agent
