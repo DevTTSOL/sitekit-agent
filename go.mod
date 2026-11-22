@@ -1,6 +1,6 @@
 module github.com/avansaber/sitekit-agent
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/gorilla/websocket v1.5.3

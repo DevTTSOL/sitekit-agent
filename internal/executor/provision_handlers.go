@@ -95,15 +95,12 @@ APT::Periodic::AutocleanInterval "7";
 	// Install Node.js and npm (LTS version)
 	output.WriteString("\n=== Installing Node.js and npm ===\n")
 	if _, err := os.Stat("/usr/bin/node"); os.IsNotExist(err) {
-		// Add NodeSource repository for LTS version
-		e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -")
-		nodeOut, _, nodeErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "nodejs")
+		// Use the distribution's signed package repository.
+		nodeOut, _, nodeErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "nodejs", "npm")
 		output.WriteString(nodeOut)
 		if nodeErr != nil {
 			output.WriteString(fmt.Sprintf("Warning: failed to install Node.js: %v\n", nodeErr))
 		} else {
-			// Update npm to latest
-			e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "npm@latest")
 			nodeVersion, _, _ := e.RunCommandWithExitCode(ctx, "node", "-v")
 			npmVersion, _, _ := e.RunCommandWithExitCode(ctx, "npm", "-v")
 			output.WriteString(fmt.Sprintf("Node.js %s and npm %s installed\n", strings.TrimSpace(nodeVersion), strings.TrimSpace(npmVersion)))
@@ -113,30 +110,21 @@ APT::Periodic::AutocleanInterval "7";
 		output.WriteString(fmt.Sprintf("Node.js already installed: %s\n", strings.TrimSpace(nodeVersion)))
 	}
 
-	// Install Yarn
-	output.WriteString("\n=== Installing Yarn ===\n")
-	yarnCheck, _, _ := e.RunCommandWithExitCode(ctx, "which", "yarn")
-	if strings.TrimSpace(yarnCheck) == "" {
-		yarnOut, _, yarnErr := e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "yarn")
-		output.WriteString(yarnOut)
-		if yarnErr != nil {
-			output.WriteString(fmt.Sprintf("Warning: failed to install Yarn: %v\n", yarnErr))
-		} else {
-			yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
-			output.WriteString(fmt.Sprintf("Yarn %s installed\n", strings.TrimSpace(yarnVersion)))
-		}
+	output.WriteString("\n=== Enabling project package managers ===\n")
+	if _, _, err := e.RunCommandWithExitCode(ctx, "corepack", "enable"); err != nil {
+		output.WriteString("Warning: Corepack is unavailable; projects must provide their own package manager\n")
 	} else {
-		yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
-		output.WriteString(fmt.Sprintf("Yarn already installed: %s\n", strings.TrimSpace(yarnVersion)))
+		output.WriteString("Corepack enabled for project-pinned Yarn and pnpm versions\n")
 	}
 
-	// Install WP-CLI for WordPress management
 	output.WriteString("\n=== Installing WP-CLI ===\n")
-	if _, err := os.Stat("/usr/local/bin/wp"); os.IsNotExist(err) {
-		// Download WP-CLI
-		e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -sS https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp")
-		e.RunCommandWithExitCode(ctx, "chmod", "+x", "/usr/local/bin/wp")
-		if _, err := os.Stat("/usr/local/bin/wp"); err == nil {
+	if _, _, err := e.RunCommandWithExitCode(ctx, "wp", "--version", "--allow-root"); err != nil {
+		wpOut, _, wpErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "wp-cli")
+		output.WriteString(wpOut)
+		if wpErr != nil {
+			output.WriteString(fmt.Sprintf("Warning: failed to install WP-CLI from the signed package repository: %v\n", wpErr))
+		}
+		if _, _, err := e.RunCommandWithExitCode(ctx, "wp", "--version", "--allow-root"); err == nil {
 			wpVersion, _, _ := e.RunCommandWithExitCode(ctx, "wp", "--version", "--allow-root")
 			output.WriteString(fmt.Sprintf("WP-CLI %s installed\n", strings.TrimSpace(wpVersion)))
 		} else {
@@ -496,21 +484,7 @@ func (e *Executor) handleProvisionMariaDB(ctx context.Context, payload json.RawM
 	}
 
 	output.WriteString("=== Adding MariaDB official repository ===\n")
-	// Add MariaDB official repository for latest versions
-	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "curl", "gnupg")
-
-	// Add MariaDB signing key
-	e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -fsSL https://mariadb.org/mariadb_release_signing_key.asc | gpg --dearmor -o /usr/share/keyrings/mariadb-keyring.gpg")
-
-	// Add MariaDB repository
-	osCodename, _, _ := e.RunCommandWithExitCode(ctx, "bash", "-c", "lsb_release -cs")
-	osCodename = strings.TrimSpace(osCodename)
-	repoLine := fmt.Sprintf("deb [signed-by=/usr/share/keyrings/mariadb-keyring.gpg] https://dlm.mariadb.com/repo/mariadb-server/%s/repo/ubuntu %s main", p.Version, osCodename)
-	os.WriteFile("/etc/apt/sources.list.d/mariadb.list", []byte(repoLine+"\n"), 0644)
-
-	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
-
-	output.WriteString(fmt.Sprintf("=== Installing MariaDB %s ===\n", p.Version))
+	output.WriteString("=== Installing MariaDB from the signed distribution repository ===\n")
 	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "mariadb-server", "mariadb-client")
 	output.WriteString(installOut)
 	if installErr != nil {
@@ -619,16 +593,12 @@ func (e *Executor) handleProvisionMySQL(ctx context.Context, payload json.RawMes
 
 	output.WriteString("=== Installing MySQL ===\n")
 
-	// Add MySQL APT repository for latest version
-	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "gnupg", "wget")
-
-	// Download and add MySQL APT config (latest version)
-	e.RunCommandWithExitCode(ctx, "bash", "-c", "wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.30-1_all.deb -O /tmp/mysql-apt-config.deb")
-	e.RunCommandWithExitCode(ctx, "bash", "-c", "DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/mysql-apt-config.deb")
-	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
-
-	// Install MySQL server
-	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mysql-server")
+	installOut, _, installErr := e.runCommandWithExitCode(
+		ctx,
+		"apt-get",
+		[]string{"install", "-y", "-qq", "mysql-server"},
+		commandOptions{env: []string{"DEBIAN_FRONTEND=noninteractive"}},
+	)
 	output.WriteString(installOut)
 	if installErr != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install MySQL: " + installErr.Error()}
@@ -747,23 +717,8 @@ func (e *Executor) handleProvisionPostgreSQL(ctx context.Context, payload json.R
 		return comm.JobResult{Success: true, Output: output.String()}
 	}
 
-	output.WriteString("=== Adding PostgreSQL official repository ===\n")
-	// Add PostgreSQL Global Development Group (PGDG) repository
-	e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "curl", "gnupg", "lsb-release")
-
-	// Add PostgreSQL signing key
-	e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg")
-
-	// Add PostgreSQL repository
-	osCodename, _, _ := e.RunCommandWithExitCode(ctx, "bash", "-c", "lsb_release -cs")
-	osCodename = strings.TrimSpace(osCodename)
-	repoLine := fmt.Sprintf("deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt %s-pgdg main", osCodename)
-	os.WriteFile("/etc/apt/sources.list.d/pgdg.list", []byte(repoLine+"\n"), 0644)
-
-	e.RunCommandWithExitCode(ctx, "apt-get", "update", "-qq")
-
-	output.WriteString(fmt.Sprintf("=== Installing PostgreSQL %s ===\n", p.Version))
-	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", fmt.Sprintf("postgresql-%s", p.Version), "postgresql-contrib")
+	output.WriteString("=== Installing PostgreSQL from the signed distribution repository ===\n")
+	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "postgresql", "postgresql-contrib")
 	output.WriteString(installOut)
 	if installErr != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install PostgreSQL: " + installErr.Error()}
@@ -785,8 +740,15 @@ func (e *Executor) handleProvisionPostgreSQL(ctx context.Context, payload json.R
 	sitekitPgPass, _, _ := e.RunCommandWithExitCode(ctx, "openssl", "rand", "-base64", "24")
 	sitekitPgPass = strings.TrimSpace(sitekitPgPass)
 
-	createUserSQL := fmt.Sprintf("CREATE USER sitekit WITH SUPERUSER CREATEDB CREATEROLE PASSWORD '%s';", sitekitPgPass)
-	e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c", createUserSQL)
+	quotedPassword, err := quotePostgresString(sitekitPgPass)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
+	}
+	if out, _, err := e.runPostgresQuery(ctx,
+		fmt.Sprintf("CREATE USER sitekit WITH SUPERUSER CREATEDB CREATEROLE PASSWORD %s;", quotedPassword),
+	); err != nil {
+		return comm.JobResult{Success: false, Output: output.String() + out, Error: err.Error()}
+	}
 
 	os.WriteFile(configDir+"/.pgsql_sitekit", []byte(sitekitPgPass), 0600)
 
@@ -887,17 +849,20 @@ func (e *Executor) handleProvisionComposer(ctx context.Context, payload json.Raw
 	log.Info().Int64("step_id", p.StepID).Msg("Provisioning Composer")
 	var output strings.Builder
 
-	if _, err := os.Stat("/usr/local/bin/composer"); err == nil {
+	if _, _, err := e.RunCommandWithExitCode(ctx, "composer", "--version"); err == nil {
 		output.WriteString("Composer is already installed\n")
 		return comm.JobResult{Success: true, Output: output.String()}
 	}
 
 	output.WriteString("=== Installing Composer ===\n")
 
-	// Download and install Composer
-	e.RunCommandWithExitCode(ctx, "bash", "-c", "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer")
+	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "composer")
+	output.WriteString(installOut)
+	if installErr != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install Composer: " + installErr.Error()}
+	}
 
-	if _, err := os.Stat("/usr/local/bin/composer"); err != nil {
+	if _, _, err := e.RunCommandWithExitCode(ctx, "composer", "--version"); err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install Composer"}
 	}
 
@@ -930,49 +895,14 @@ func (e *Executor) handleProvisionNode(ctx context.Context, payload json.RawMess
 
 	output.WriteString(fmt.Sprintf("=== Installing Node.js %s ===\n", p.Version))
 
-	// Add NodeSource repository
-	setupScript := fmt.Sprintf("curl -fsSL https://deb.nodesource.com/setup_%s.x | bash -", p.Version)
-	e.RunCommandWithExitCode(ctx, "bash", "-c", setupScript)
-
 	installOut, _, installErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "nodejs")
 	output.WriteString(installOut)
 	if installErr != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to install Node.js: " + installErr.Error()}
 	}
 
-	// Update npm
-	e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "npm@latest")
-
-	// Install Yarn globally
-	yarnCheck, _, _ := e.RunCommandWithExitCode(ctx, "which", "yarn")
-	if strings.TrimSpace(yarnCheck) == "" {
-		yarnOut, _, yarnErr := e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "yarn")
-		output.WriteString(yarnOut)
-		if yarnErr != nil {
-			output.WriteString(fmt.Sprintf("Warning: failed to install Yarn: %v\n", yarnErr))
-		} else {
-			yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
-			output.WriteString(fmt.Sprintf("Yarn %s installed\n", strings.TrimSpace(yarnVersion)))
-		}
-	} else {
-		yarnVersion, _, _ := e.RunCommandWithExitCode(ctx, "yarn", "-v")
-		output.WriteString(fmt.Sprintf("Yarn already installed: %s\n", strings.TrimSpace(yarnVersion)))
-	}
-
-	// Install pnpm globally
-	pnpmCheck, _, _ := e.RunCommandWithExitCode(ctx, "which", "pnpm")
-	if strings.TrimSpace(pnpmCheck) == "" {
-		pnpmOut, _, pnpmErr := e.RunCommandWithExitCode(ctx, "npm", "install", "-g", "pnpm")
-		output.WriteString(pnpmOut)
-		if pnpmErr != nil {
-			output.WriteString(fmt.Sprintf("Warning: failed to install pnpm: %v\n", pnpmErr))
-		} else {
-			pnpmVersion, _, _ := e.RunCommandWithExitCode(ctx, "pnpm", "-v")
-			output.WriteString(fmt.Sprintf("pnpm %s installed\n", strings.TrimSpace(pnpmVersion)))
-		}
-	} else {
-		pnpmVersion, _, _ := e.RunCommandWithExitCode(ctx, "pnpm", "-v")
-		output.WriteString(fmt.Sprintf("pnpm already installed: %s\n", strings.TrimSpace(pnpmVersion)))
+	if _, _, err := e.RunCommandWithExitCode(ctx, "corepack", "enable"); err != nil {
+		output.WriteString("Warning: Corepack is unavailable; projects must provide their own package manager\n")
 	}
 
 	nodeVersion, _, _ := e.RunCommandWithExitCode(ctx, "node", "-v")
@@ -1094,37 +1024,24 @@ func (e *Executor) isServiceInstalled(ctx context.Context, serviceName string) b
 // runMySQLCommand executes a MySQL command securely without exposing password in process list
 // Uses a temporary defaults file instead of passing password as command argument
 func (e *Executor) runMySQLCommand(ctx context.Context, user, password, query string) (string, int, error) {
-	// Create temporary defaults file with credentials
-	tmpFile, err := os.CreateTemp("", "mysql-defaults-*.cnf")
-	if err != nil {
-		return "", -1, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	// Write credentials to temp file (not visible in process list)
-	defaultsContent := fmt.Sprintf("[client]\nuser=%s\npassword=%s\n", user, password)
-	if _, err := tmpFile.WriteString(defaultsContent); err != nil {
-		tmpFile.Close()
-		return "", -1, fmt.Errorf("failed to write defaults file: %w", err)
-	}
-	tmpFile.Close()
-
-	// Set restrictive permissions
-	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
-		return "", -1, fmt.Errorf("failed to set file permissions: %w", err)
-	}
-
-	// Run mysql with defaults file (password not visible in ps/htop)
-	return e.RunCommandWithExitCode(ctx, "mysql", fmt.Sprintf("--defaults-extra-file=%s", tmpFile.Name()), "-e", query)
+	return e.runMySQLProgramWithCredentials(
+		ctx,
+		mysqlProgram(),
+		user,
+		password,
+		nil,
+		strings.NewReader(query+"\n"),
+		nil,
+	)
 }
 
 // runMySQLCommandNoAuth executes a MySQL command without authentication (for initial setup)
 // Uses sudo to leverage unix_socket authentication for MariaDB/MySQL
 func (e *Executor) runMySQLCommandNoAuth(ctx context.Context, query string) (string, int, error) {
-	// First try mariadb command (for MariaDB installations)
-	if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
-		return e.RunCommandWithExitCode(ctx, "mariadb", "-e", query)
-	}
-	// Fallback to mysql command
-	return e.RunCommandWithExitCode(ctx, "mysql", "-e", query)
+	return e.runCommandWithExitCode(
+		ctx,
+		mysqlProgram(),
+		nil,
+		commandOptions{stdin: strings.NewReader(query + "\n")},
+	)
 }

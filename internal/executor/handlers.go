@@ -1,15 +1,20 @@
 package executor
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/avansaber/sitekit-agent/internal/comm"
 	"github.com/rs/zerolog/log"
@@ -518,9 +523,9 @@ func (e *Executor) handleSSHKeySync(ctx context.Context, payload json.RawMessage
 
 func (e *Executor) handleFirewallApply(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		RuleID    string `json:"rule_id"`
-		Command   string `json:"command"` // e.g., "ufw allow in proto tcp to any port 22"
-		IsRollback bool  `json:"is_rollback"`
+		RuleID     string `json:"rule_id"`
+		Command    string `json:"command"` // e.g., "ufw allow in proto tcp to any port 22"
+		IsRollback bool   `json:"is_rollback"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -570,15 +575,15 @@ func (e *Executor) handleFirewallRevert(ctx context.Context, payload json.RawMes
 
 func (e *Executor) handleCreateWebApp(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID            string `json:"app_id"`
-		Domain           string `json:"domain"`
-		Username         string `json:"username"`
-		RootPath         string `json:"root_path"`
-		PublicPath       string `json:"public_path"`
-		PhpVersion       string `json:"php_version"`
-		AppType          string `json:"app_type"` // php, static, nodejs
-		NginxConfig      string `json:"nginx_config"`
-		FpmConfig        string `json:"fpm_config"`
+		AppID       string `json:"app_id"`
+		Domain      string `json:"domain"`
+		Username    string `json:"username"`
+		RootPath    string `json:"root_path"`
+		PublicPath  string `json:"public_path"`
+		PhpVersion  string `json:"php_version"`
+		AppType     string `json:"app_type"` // php, static, nodejs
+		NginxConfig string `json:"nginx_config"`
+		FpmConfig   string `json:"fpm_config"`
 		// Node.js specific fields
 		NodeVersion      string `json:"node_version"`
 		NodePort         int    `json:"node_port"`
@@ -900,11 +905,11 @@ func (e *Executor) handleDeleteWebApp(ctx context.Context, payload json.RawMessa
 
 func (e *Executor) handleIssueSSL(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		CertID    string   `json:"certificate_id"` // Match SaaS payload
-		Domains   []string `json:"domains"`
-		Email     string   `json:"email"`
-		Webroot   string   `json:"webroot"`
-		Staging   bool     `json:"staging"`
+		CertID  string   `json:"certificate_id"` // Match SaaS payload
+		Domains []string `json:"domains"`
+		Email   string   `json:"email"`
+		Webroot string   `json:"webroot"`
+		Staging bool     `json:"staging"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -1053,31 +1058,6 @@ func (e *Executor) handleInstallSSL(ctx context.Context, payload json.RawMessage
 
 // Database handlers
 
-// getMySQLArgs returns the common args for MySQL commands with authentication using sitekit user
-func (e *Executor) getMySQLArgs(query string) []string {
-	if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
-		return []string{"-u", e.mysqlConfig.User, "-p" + e.mysqlConfig.Password, "-e", query}
-	}
-	// Fallback to reading sitekit password from file (preferred - has full privileges)
-	data, err := os.ReadFile("/opt/sitekit/config/.mysql_sitekit")
-	if err == nil {
-		password := strings.TrimSpace(string(data))
-		if password != "" {
-			return []string{"-u", "sitekit", "-p" + password, "-e", query}
-		}
-	}
-	// Last resort: try root password (may not work on unix_socket-only systems)
-	data, err = os.ReadFile("/opt/sitekit/config/.mysql_root")
-	if err == nil {
-		password := strings.TrimSpace(string(data))
-		if password != "" {
-			return []string{"-u", "root", "-p" + password, "-e", query}
-		}
-	}
-	log.Warn().Msg("No MySQL credentials available")
-	return []string{"-e", query}
-}
-
 func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
 		DatabaseID   string `json:"database_id"`
@@ -1100,9 +1080,12 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 
 	switch p.DatabaseType {
 	case "mysql", "mariadb":
-		// Create database
-		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(createDB)...)
+		database, err := quoteMySQLIdentifier(p.DatabaseName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
+		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;", database)
+		out, _, err := e.runMySQLQuery(ctx, createDB)
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -1114,15 +1097,27 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 			if host == "" {
 				host = "localhost"
 			}
-			createUser := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s';", p.Username, host, p.Password)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(createUser)...)
+			quotedUser, err := quoteMySQLString(p.Username)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			quotedHost, err := quoteMySQLString(host)
+			if err != nil || validateMySQLHost(host) != nil {
+				return comm.JobResult{Success: false, Error: "invalid database host or user"}
+			}
+			quotedPassword, err := quoteMySQLString(p.Password)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			createUser := fmt.Sprintf("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s;", quotedUser, quotedHost, quotedPassword)
+			out, _, err = e.runMySQLQuery(ctx, createUser)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
 			}
 
-			grant := fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%s'; FLUSH PRIVILEGES;", p.DatabaseName, p.Username, host)
-			out, _, err = e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(grant)...)
+			grant := fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO %s@%s; FLUSH PRIVILEGES;", database, quotedUser, quotedHost)
+			out, _, err = e.runMySQLQuery(ctx, grant)
 			output.WriteString(out + "\n")
 			if err != nil {
 				return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
@@ -1130,19 +1125,35 @@ func (e *Executor) handleCreateDatabase(ctx context.Context, payload json.RawMes
 		}
 
 	case "postgresql":
-		// Create database
-		out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
-			fmt.Sprintf("CREATE DATABASE \"%s\";", p.DatabaseName))
+		database, err := quotePostgresIdentifier(p.DatabaseName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
+		out, _, err := e.runPostgresQuery(ctx, fmt.Sprintf("CREATE DATABASE %s;", database))
+		if err != nil {
+			return comm.JobResult{Success: false, Output: out, Error: err.Error()}
+		}
 		output.WriteString(out + "\n")
 
-		// Create user and grant privileges
 		if p.Username != "" && p.Password != "" {
-			out, _, _ = e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
-				fmt.Sprintf("CREATE USER \"%s\" WITH PASSWORD '%s';", p.Username, p.Password))
+			username, err := quotePostgresIdentifier(p.Username)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			password, err := quotePostgresString(p.Password)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			out, _, err = e.runPostgresQuery(ctx, fmt.Sprintf("CREATE USER %s WITH PASSWORD %s;", username, password))
+			if err != nil {
+				return comm.JobResult{Success: false, Output: out, Error: err.Error()}
+			}
 			output.WriteString(out + "\n")
 
-			out, _, _ = e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
-				fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE \"%s\" TO \"%s\";", p.DatabaseName, p.Username))
+			out, _, err = e.runPostgresQuery(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %s TO %s;", database, username))
+			if err != nil {
+				return comm.JobResult{Success: false, Output: out, Error: err.Error()}
+			}
 			output.WriteString(out + "\n")
 		}
 
@@ -1170,36 +1181,54 @@ func (e *Executor) handleDeleteDatabase(ctx context.Context, payload json.RawMes
 
 	switch p.DatabaseType {
 	case "mysql", "mariadb":
-		// Drop user if exists
+		database, err := quoteMySQLIdentifier(p.DatabaseName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
 		if p.Username != "" {
 			host := p.Host
 			if host == "" {
 				host = "localhost"
 			}
-			dropUser := fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s';", p.Username, host)
-			out, _, _ := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(dropUser)...)
+			if err := validateMySQLHost(host); err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			quotedUser, err := quoteMySQLString(p.Username)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			quotedHost, err := quoteMySQLString(host)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			out, _, _ := e.runMySQLQuery(ctx, fmt.Sprintf("DROP USER IF EXISTS %s@%s;", quotedUser, quotedHost))
 			output.WriteString(out + "\n")
 		}
 
-		// Drop database
-		dropDB := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", p.DatabaseName)
-		out, _, err := e.RunCommandWithExitCode(ctx, "mysql", e.getMySQLArgs(dropDB)...)
+		out, _, err := e.runMySQLQuery(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s;", database))
 		output.WriteString(out + "\n")
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: err.Error()}
 		}
 
 	case "postgresql":
-		// Drop user if exists
+		database, err := quotePostgresIdentifier(p.DatabaseName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
 		if p.Username != "" {
-			out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
-				fmt.Sprintf("DROP USER IF EXISTS \"%s\";", p.Username))
+			username, err := quotePostgresIdentifier(p.Username)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: err.Error()}
+			}
+			out, _, _ := e.runPostgresQuery(ctx, fmt.Sprintf("DROP USER IF EXISTS %s;", username))
 			output.WriteString(out + "\n")
 		}
 
-		// Drop database
-		out, _, _ := e.RunCommandWithExitCode(ctx, "sudo", "-u", "postgres", "psql", "-c",
-			fmt.Sprintf("DROP DATABASE IF EXISTS \"%s\";", p.DatabaseName))
+		out, _, err := e.runPostgresQuery(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s;", database))
+		if err != nil {
+			return comm.JobResult{Success: false, Output: out, Error: err.Error()}
+		}
 		output.WriteString(out + "\n")
 
 	default:
@@ -1277,11 +1306,12 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 	if len(releaseHash) > 12 {
 		releaseHash = releaseHash[:12]
 	}
-	releaseDir := filepath.Join(p.AppPath, "releases", releaseHash)
-
-	// Check if release exists
-	if _, err := os.Stat(releaseDir); os.IsNotExist(err) {
+	releaseDir, err := findReleaseForRollback(filepath.Join(p.AppPath, "releases"), releaseHash)
+	if os.IsNotExist(err) {
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("release %s not found", releaseHash)}
+	}
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	// Atomic symlink swap
@@ -1289,7 +1319,11 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 	tempLink := filepath.Join(p.AppPath, ".current.tmp")
 
 	os.Remove(tempLink)
-	if err := os.Symlink(releaseDir, tempLink); err != nil {
+	relativeReleaseTarget, err := relativeSymlinkTarget(tempLink, releaseDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if err := os.Symlink(relativeReleaseTarget, tempLink); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -1302,6 +1336,33 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 		Success: true,
 		Output:  fmt.Sprintf("Rolled back to release %s", releaseHash),
 	}
+}
+
+func findReleaseForRollback(releasesDir, releaseHash string) (string, error) {
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return "", err
+	}
+
+	var releasePath string
+	var latestModTime int64
+	for _, entry := range entries {
+		if !entry.IsDir() || (entry.Name() != releaseHash && !strings.HasPrefix(entry.Name(), releaseHash+"-")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if releasePath == "" || info.ModTime().UnixNano() > latestModTime {
+			releasePath = filepath.Join(releasesDir, entry.Name())
+			latestModTime = info.ModTime().UnixNano()
+		}
+	}
+	if releasePath == "" {
+		return "", os.ErrNotExist
+	}
+	return releasePath, nil
 }
 
 // Cleanup old releases
@@ -1384,12 +1445,13 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		CommitHash        string   `json:"commit_hash"`
 		SSHUrl            string   `json:"ssh_url"`
 		DeployKey         string   `json:"deploy_key"`
+		SSHKnownHosts     string   `json:"ssh_known_hosts"`
 		SharedFiles       []string `json:"shared_files"`
 		SharedDirectories []string `json:"shared_directories"`
 		BuildScript       string   `json:"build_script"`
 		PHPVersion        string   `json:"php_version"`
 		// Node.js specific fields
-		AppType          string `json:"app_type"`           // php, nodejs, static
+		AppType          string `json:"app_type"` // php, nodejs, static
 		NodeVersion      string `json:"node_version"`
 		PackageManager   string `json:"package_manager"`    // npm, yarn, pnpm
 		CacheNodeModules bool   `json:"cache_node_modules"` // Share node_modules across deploys
@@ -1400,6 +1462,17 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+
+	if !regexp.MustCompile(`^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$`).MatchString(p.CommitHash) {
+		return comm.JobResult{Success: false, Error: "commit_hash must be a full SHA-1 or SHA-256 commit hash"}
+	}
+	account, appPath, err := validateManagedUserPath(p.Username, p.AppPath)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	p.AppPath = appPath
+	uid, _ := strconv.Atoi(account.Uid)
+	gid, _ := strconv.Atoi(account.Gid)
 
 	log.Info().
 		Str("deployment_id", p.DeploymentID).
@@ -1413,41 +1486,133 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	// Setup directories
 	releasesDir := filepath.Join(p.AppPath, "releases")
 	sharedDir := filepath.Join(p.AppPath, "shared")
-	releaseDir := filepath.Join(releasesDir, p.CommitHash[:12])
-	os.MkdirAll(releaseDir, 0755)
-	os.MkdirAll(sharedDir, 0755)
-
-	// Setup deploy key for SSH authentication
-	if p.DeployKey != "" {
-		keyPath := filepath.Join(os.TempDir(), fmt.Sprintf("sitekit-deploy-%s", p.DeploymentID))
-		if err := os.WriteFile(keyPath, []byte(p.DeployKey), 0600); err != nil {
-			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
+	releaseName := strings.ToLower(p.CommitHash[:12])
+	for _, dir := range []string{releasesDir, sharedDir} {
+		if out, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", dir); err != nil {
+			return comm.JobResult{Success: false, Output: out, Error: "Failed to prepare deployment directory: " + err.Error()}
 		}
-		defer os.Remove(keyPath)
-
-		// Set GIT_SSH_COMMAND for this deployment
-		os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", keyPath))
-		defer os.Unsetenv("GIT_SSH_COMMAND")
+	}
+	sharedPaths := append(append([]string{}, p.SharedDirectories...), p.SharedFiles...)
+	if p.CacheNodeModules && p.AppType == "nodejs" {
+		sharedPaths = append(sharedPaths, "node_modules")
+	}
+	if err := migrateDeploymentSymlinks(p.AppPath, sharedPaths); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to migrate deployment symlinks: " + err.Error()}
 	}
 
-	// Clone repository using SSH URL
+	cloneEnvironment := []string{}
+	knownHostsPath := "/opt/sitekit/config/ssh_known_hosts"
+	deployKeyPath := ""
+	if p.DeployKey != "" {
+		keyFile, err := os.CreateTemp("", "sitekit-deploy-key-*")
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
+		}
+		keyPath := keyFile.Name()
+		deployKeyPath = keyPath
+		defer os.Remove(keyPath)
+		if _, err := keyFile.WriteString(p.DeployKey); err != nil {
+			keyFile.Close()
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
+		}
+		if err := keyFile.Chown(uid, gid); err != nil {
+			keyFile.Close()
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to secure deploy key: " + err.Error()}
+		}
+		if err := keyFile.Chmod(0600); err != nil {
+			keyFile.Close()
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to secure deploy key: " + err.Error()}
+		}
+		if err := keyFile.Close(); err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to close deploy key: " + err.Error()}
+		}
+	}
+
+	if p.SSHKnownHosts != "" {
+		knownHostsFile, err := os.CreateTemp("", "sitekit-known-hosts-*")
+		if err != nil {
+			return comm.JobResult{Success: false, Error: "Failed to create known_hosts file: " + err.Error()}
+		}
+		knownHostsPath = knownHostsFile.Name()
+		defer os.Remove(knownHostsPath)
+		if _, err := knownHostsFile.WriteString(p.SSHKnownHosts); err != nil {
+			knownHostsFile.Close()
+			return comm.JobResult{Success: false, Error: "Failed to write known_hosts file: " + err.Error()}
+		}
+		knownHostsFile.Close()
+		if err := os.Chown(knownHostsPath, uid, gid); err != nil {
+			return comm.JobResult{Success: false, Error: "Failed to secure known_hosts: " + err.Error()}
+		}
+		if err := os.Chmod(knownHostsPath, 0600); err != nil {
+			return comm.JobResult{Success: false, Error: "Failed to secure known_hosts: " + err.Error()}
+		}
+	}
+
 	cloneUrl := p.SSHUrl
 	if cloneUrl == "" {
 		cloneUrl = p.Repository
 	}
+	if isSSHRemote(cloneUrl) {
+		if p.SSHKnownHosts == "" {
+			knownHosts, err := os.ReadFile(knownHostsPath)
+			if err != nil {
+				return comm.JobResult{Success: false, Error: "SSH deployment requires a trusted known_hosts entry"}
+			}
+			knownHostsFile, err := os.CreateTemp("", "sitekit-known-hosts-*")
+			if err != nil {
+				return comm.JobResult{Success: false, Error: "Failed to stage known_hosts file: " + err.Error()}
+			}
+			knownHostsPath = knownHostsFile.Name()
+			defer os.Remove(knownHostsPath)
+			if _, err := knownHostsFile.Write(knownHosts); err != nil {
+				knownHostsFile.Close()
+				return comm.JobResult{Success: false, Error: "Failed to stage known_hosts file: " + err.Error()}
+			}
+			knownHostsFile.Close()
+			if err := os.Chown(knownHostsPath, uid, gid); err != nil {
+				return comm.JobResult{Success: false, Error: "Failed to secure known_hosts: " + err.Error()}
+			}
+			if err := os.Chmod(knownHostsPath, 0600); err != nil {
+				return comm.JobResult{Success: false, Error: "Failed to secure known_hosts: " + err.Error()}
+			}
+		}
+		cloneEnvironment = []string{"GIT_SSH_COMMAND=" + sshCommand(deployKeyPath, knownHostsPath)}
+	}
+
+	stagingOutput, _, err := e.runCommandAsUser(
+		ctx, p.Username, p.AppPath, nil, "mktemp", "-d", "--", filepath.Join(releasesDir, releaseName+"-XXXXXX"),
+	)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to stage release: " + err.Error()}
+	}
+	releaseDir := filepath.Clean(strings.TrimSpace(stagingOutput))
+	if filepath.Dir(releaseDir) != filepath.Clean(releasesDir) ||
+		!strings.HasPrefix(filepath.Base(releaseDir), releaseName+"-") {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to stage release: invalid staging directory"}
+	}
+	activated := false
+	defer func() {
+		if !activated {
+			e.runCommandAsUser(context.Background(), p.Username, p.AppPath, nil, "rm", "-rf", releaseDir)
+		}
+	}()
+
 	output.WriteString(fmt.Sprintf("Cloning %s (branch: %s)...\n", p.Repository, p.Branch))
-	out, _, err := e.RunCommandWithExitCode(ctx, "git", "clone", "--depth=1", "--branch="+p.Branch, cloneUrl, releaseDir)
+	out, _, err := e.runCommandAsUser(
+		ctx, p.Username, p.AppPath, cloneEnvironment,
+		"git", "clone", "--depth=1", "--branch="+p.Branch, "--", cloneUrl, releaseDir,
+	)
 	output.WriteString(out + "\n")
 	if err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Clone failed: " + err.Error()}
 	}
 
-	// Set ownership for the app directory
-	if p.Username != "" {
-		output.WriteString(fmt.Sprintf("Setting ownership to %s...\n", p.Username))
-		if out, err := e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, p.AppPath); err != nil {
-			log.Warn().Err(err).Str("output", out).Msg("Failed to set ownership")
-		}
+	headOutput, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "git", "-C", releaseDir, "rev-parse", "HEAD")
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Commit verification failed: " + err.Error()}
+	}
+	if !strings.EqualFold(strings.TrimSpace(headOutput), p.CommitHash) {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "commit hash does not match checked-out repository"}
 	}
 
 	// Setup shared directories (create in shared and symlink to release)
@@ -1456,16 +1621,19 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		releasePath := filepath.Join(releaseDir, dir)
 
 		// Create shared directory if it doesn't exist
-		os.MkdirAll(sharedPath, 0755)
+		if out, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", sharedPath); err != nil {
+			return comm.JobResult{Success: false, Output: out, Error: "Failed to create shared directory: " + err.Error()}
+		}
 
-		// Remove release path if exists (could be from clone)
-		os.RemoveAll(releasePath)
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-rf", releasePath)
 
-		// Create parent directory for symlink
-		os.MkdirAll(filepath.Dir(releasePath), 0755)
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", filepath.Dir(releasePath))
 
-		// Create symlink
-		if err := os.Symlink(sharedPath, releasePath); err != nil {
+		relativeTarget, err := relativeSymlinkTarget(releasePath, sharedPath)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared directory: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, releasePath); err != nil {
 			log.Warn().Err(err).Str("dir", dir).Msg("Failed to symlink shared directory")
 		} else {
 			output.WriteString(fmt.Sprintf("Linked shared directory: %s\n", dir))
@@ -1477,18 +1645,20 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		sharedPath := filepath.Join(sharedDir, file)
 		releasePath := filepath.Join(releaseDir, file)
 
-		// If shared file doesn't exist but release has it, copy it
 		if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
 			if _, err := os.Stat(releasePath); err == nil {
-				os.MkdirAll(filepath.Dir(sharedPath), 0755)
-				e.RunCommand(ctx, "cp", releasePath, sharedPath)
+				e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", filepath.Dir(sharedPath))
+				e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "cp", releasePath, sharedPath)
 			}
 		}
 
-		// Remove release file and create symlink
-		os.Remove(releasePath)
-		os.MkdirAll(filepath.Dir(releasePath), 0755)
-		if err := os.Symlink(sharedPath, releasePath); err != nil {
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-f", releasePath)
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", filepath.Dir(releasePath))
+		relativeTarget, err := relativeSymlinkTarget(releasePath, sharedPath)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared file: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, releasePath); err != nil {
 			log.Warn().Err(err).Str("file", file).Msg("Failed to symlink shared file")
 		} else {
 			output.WriteString(fmt.Sprintf("Linked shared file: %s\n", file))
@@ -1500,93 +1670,83 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		nodeModulesShared := filepath.Join(sharedDir, "node_modules")
 		nodeModulesRelease := filepath.Join(releaseDir, "node_modules")
 
-		// Create shared node_modules directory if it doesn't exist
 		if _, err := os.Stat(nodeModulesShared); os.IsNotExist(err) {
-			os.MkdirAll(nodeModulesShared, 0755)
+			e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", nodeModulesShared)
 			output.WriteString("Created shared node_modules directory\n")
 		}
 
-		// Remove node_modules from release if it exists (from clone)
-		os.RemoveAll(nodeModulesRelease)
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-rf", nodeModulesRelease)
 
-		// Create symlink to shared node_modules
-		if err := os.Symlink(nodeModulesShared, nodeModulesRelease); err != nil {
+		relativeTarget, err := relativeSymlinkTarget(nodeModulesRelease, nodeModulesShared)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared node_modules: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, nodeModulesRelease); err != nil {
 			log.Warn().Err(err).Msg("Failed to symlink node_modules")
 			output.WriteString(fmt.Sprintf("Warning: Failed to symlink node_modules: %v\n", err))
 		} else {
 			output.WriteString("Linked shared node_modules for faster deployments\n")
 		}
-
-		// Set ownership for shared node_modules
-		if p.Username != "" {
-			if out, err := e.RunCommand(ctx, "chown", "-R", p.Username+":"+p.Username, nodeModulesShared); err != nil {
-				log.Warn().Err(err).Str("output", out).Msg("Failed to set node_modules ownership")
-			}
-		}
 	}
 
-	// Helper function to build environment setup script
 	buildEnvSetup := func() string {
 		envSetup := ""
-		// Add PHP to PATH if PHP app
 		if p.PHPVersion != "" && (p.AppType == "" || p.AppType == "php") {
-			envSetup += fmt.Sprintf("export PATH=/usr/bin/php%s:$PATH\n", p.PHPVersion)
+			envSetup += "export PATH=\"/usr/bin/php${SITEKIT_PHP_VERSION}:$PATH\"\n"
 		}
-		// Add Node.js environment if Node.js app
 		if p.AppType == "nodejs" && p.NodeVersion != "" {
 			envSetup += `
-# Load nvm if available
 export NVM_DIR="/usr/local/nvm"
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     source "$NVM_DIR/nvm.sh"
-    nvm use ` + p.NodeVersion + ` 2>/dev/null || true
+    nvm use "$SITEKIT_NODE_VERSION" 2>/dev/null || true
 fi
-
-# Set Node.js environment
 export NODE_ENV=production
-export HOME=/home/` + p.Username + `
-
+export HOME="$SITEKIT_HOME"
 `
 		}
 		return envSetup
 	}
+	scriptEnvironment := []string{
+		"SITEKIT_HOME=" + account.HomeDir,
+		"SITEKIT_PHP_VERSION=" + p.PHPVersion,
+		"SITEKIT_NODE_VERSION=" + p.NodeVersion,
+	}
 
-	// Run pre-deploy script if provided
 	if p.PreDeployScript != "" {
 		output.WriteString("Running pre-deploy script...\n")
 		scriptPath := filepath.Join(releaseDir, ".sitekit-pre-deploy.sh")
-		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent := "#!/bin/bash\nset -e\n"
 		scriptContent += buildEnvSetup()
 		scriptContent += p.PreDeployScript
 
-		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		if err := writeUserFile(p.Username, scriptPath, []byte(scriptContent), 0755); err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write pre-deploy script: " + err.Error()}
 		}
 
-		out, _, err = e.RunCommandWithExitCode(ctx, "bash", scriptPath)
+		out, _, err = e.runCommandAsUser(ctx, p.Username, releaseDir, scriptEnvironment, "bash", scriptPath)
 		output.WriteString(out + "\n")
-		os.Remove(scriptPath)
+		e.runCommandAsUser(ctx, p.Username, releaseDir, nil, "rm", "-f", scriptPath)
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Pre-deploy script failed: " + err.Error()}
 		}
 		output.WriteString("Pre-deploy script completed\n")
 	}
 
-	// Run build script if provided
 	if p.BuildScript != "" {
 		output.WriteString("Running build script...\n")
 		scriptPath := filepath.Join(releaseDir, ".sitekit-deploy.sh")
-		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent := "#!/bin/bash\nset -e\n"
 		scriptContent += buildEnvSetup()
 		scriptContent += p.BuildScript
 
-		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		if err := writeUserFile(p.Username, scriptPath, []byte(scriptContent), 0755); err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write build script: " + err.Error()}
 		}
 
-		out, _, err = e.RunCommandWithExitCode(ctx, "bash", scriptPath)
+		out, _, err = e.runCommandAsUser(ctx, p.Username, releaseDir, scriptEnvironment, "bash", scriptPath)
 		output.WriteString(out + "\n")
-		os.Remove(scriptPath)
+		e.runCommandAsUser(ctx, p.Username, releaseDir, nil, "rm", "-f", scriptPath)
 		if err != nil {
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Build script failed: " + err.Error()}
 		}
@@ -1596,44 +1756,45 @@ export HOME=/home/` + p.Username + `
 	currentLink := filepath.Join(p.AppPath, "current")
 	tempLink := filepath.Join(p.AppPath, ".current.tmp")
 
-	// Check if current is a directory (not a symlink) and remove it
 	if info, err := os.Lstat(currentLink); err == nil {
 		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 			// It's a real directory, not a symlink - move to releases as backup
 			backupPath := filepath.Join(p.AppPath, "releases", "initial_backup")
-			os.Rename(currentLink, backupPath)
+			e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mv", currentLink, backupPath)
 			output.WriteString("Moved existing current directory to releases/initial_backup\n")
 		}
 	}
 
-	// Create temp symlink
-	os.Remove(tempLink)
-	if err := os.Symlink(releaseDir, tempLink); err != nil {
+	e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-f", tempLink)
+	relativeReleaseTarget, err := relativeSymlinkTarget(tempLink, releaseDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve release symlink: " + err.Error()}
+	}
+	if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeReleaseTarget, tempLink); err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to create symlink: " + err.Error()}
 	}
 
-	// Atomic rename (this works when replacing a symlink or when target doesn't exist)
-	if err := os.Rename(tempLink, currentLink); err != nil {
-		os.Remove(tempLink)
+	if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mv", "-Tf", tempLink, currentLink); err != nil {
+		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-f", tempLink)
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to activate release: " + err.Error()}
 	}
 
+	activated = true
 	output.WriteString("Release activated\n")
 
-	// Run post-deploy script if provided
 	if p.PostDeployScript != "" {
 		output.WriteString("Running post-deploy script...\n")
 		scriptPath := filepath.Join(releaseDir, ".sitekit-post-deploy.sh")
-		scriptContent := "#!/bin/bash\nset -e\ncd " + releaseDir + "\n"
+		scriptContent := "#!/bin/bash\nset -e\n"
 		scriptContent += buildEnvSetup()
 		scriptContent += p.PostDeployScript
 
-		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		if err := writeUserFile(p.Username, scriptPath, []byte(scriptContent), 0755); err != nil {
 			output.WriteString(fmt.Sprintf("Warning: Failed to write post-deploy script: %v\n", err))
 		} else {
-			out, _, err := e.RunCommandWithExitCode(ctx, "bash", scriptPath)
+			out, _, err := e.runCommandAsUser(ctx, p.Username, releaseDir, scriptEnvironment, "bash", scriptPath)
 			output.WriteString(out + "\n")
-			os.Remove(scriptPath)
+			e.runCommandAsUser(ctx, p.Username, releaseDir, nil, "rm", "-f", scriptPath)
 			if err != nil {
 				// Post-deploy failure is a warning, not a hard failure
 				output.WriteString(fmt.Sprintf("Warning: Post-deploy script failed: %v\n", err))
@@ -1653,6 +1814,21 @@ export HOME=/home/` + p.Username + `
 	}
 }
 
+func isSSHRemote(remote string) bool {
+	if strings.HasPrefix(remote, "ssh://") {
+		return true
+	}
+	if strings.Contains(remote, "://") {
+		return false
+	}
+	colon := strings.IndexByte(remote, ':')
+	if colon <= 0 {
+		return false
+	}
+	slash := strings.IndexByte(remote, '/')
+	return slash == -1 || colon < slash
+}
+
 // Script handler
 
 func (e *Executor) handleRunScript(ctx context.Context, payload json.RawMessage) comm.JobResult {
@@ -1665,28 +1841,44 @@ func (e *Executor) handleRunScript(ctx context.Context, payload json.RawMessage)
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Write script to temp file
-	tmpFile, err := os.CreateTemp("", "sitekit-script-*.sh")
+	account, err := lookupManagedUser(p.Username)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
-	defer os.Remove(tmpFile.Name())
+	workDir := p.WorkDir
+	if workDir == "" {
+		workDir = account.HomeDir
+	}
+	_, workDir, err = validateManagedUserPath(p.Username, workDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
 
+	tmpFile, tmpPath, err := createUserTempFile(p.Username, workDir, ".sitekit-script-", 0700)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer func() {
+		tmpFile.Close()
+		e.runCommandAsUser(ctx, p.Username, workDir, nil, "rm", "-f", tmpPath)
+	}()
+
+	uid, _ := strconv.Atoi(account.Uid)
+	gid, _ := strconv.Atoi(account.Gid)
+	if err := tmpFile.Chown(uid, gid); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
 	if _, err := tmpFile.WriteString(p.Script); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
-	tmpFile.Close()
-	os.Chmod(tmpFile.Name(), 0755)
-
-	// Run as specified user if provided
-	var output string
-	var exitCode int
-	if p.Username != "" && p.Username != "root" {
-		output, exitCode, err = e.RunCommandWithExitCode(ctx, "sudo", "-u", p.Username, "bash", tmpFile.Name())
-	} else {
-		output, exitCode, err = e.RunCommandWithExitCode(ctx, "bash", tmpFile.Name())
+	if err := tmpFile.Chmod(0700); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if err := tmpFile.Close(); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
+	output, exitCode, err := e.runCommandAsUser(ctx, p.Username, workDir, nil, "bash", tmpPath)
 	return comm.JobResult{
 		Success:  err == nil,
 		Output:   output,
@@ -1746,10 +1938,8 @@ func getInstallCommands(serviceType, version string, extensions []string) [][]st
 		}
 	case "nodejs":
 		return [][]string{
-			{"bash", "-c", fmt.Sprintf("curl -fsSL https://deb.nodesource.com/setup_%s.x | bash -", version)},
+			{"apt-get", "update"},
 			{"apt-get", "install", "-y", "nodejs"},
-			{"npm", "install", "-g", "npm@latest"},
-			{"npm", "install", "-g", "pm2"},
 		}
 	case "mysql":
 		return [][]string{
@@ -1789,8 +1979,8 @@ func getInstallCommands(serviceType, version string, extensions []string) [][]st
 		}
 	case "composer":
 		return [][]string{
-			{"bash", "-c", "curl -sS https://getcomposer.org/installer | php"},
-			{"mv", "composer.phar", "/usr/local/bin/composer"},
+			{"apt-get", "update"},
+			{"apt-get", "install", "-y", "composer"},
 		}
 	default:
 		return [][]string{}
@@ -1818,28 +2008,55 @@ func (e *Executor) handleCreateDatabaseUser(ctx context.Context, payload json.Ra
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	var cmd string
 	host := "localhost"
 	if p.CanRemote {
 		host = "%"
 	}
 
+	var output string
+	var exitCode int
+	var err error
 	switch p.Type {
 	case "mysql", "mariadb":
-		cmd = fmt.Sprintf(
-			"mysql -e \"CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%s'; FLUSH PRIVILEGES;\"",
-			p.Username, host, p.Password, p.DBName, p.Username, host,
+		database, quoteErr := quoteMySQLIdentifier(p.DBName)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		username, quoteErr := quoteMySQLString(p.Username)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		quotedHost, quoteErr := quoteMySQLString(host)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		password, quoteErr := quoteMySQLString(p.Password)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		query := fmt.Sprintf(
+			"CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s; GRANT ALL PRIVILEGES ON %s.* TO %s@%s; FLUSH PRIVILEGES;",
+			username, quotedHost, password, database, username, quotedHost,
 		)
+		output, exitCode, err = e.runMySQLQuery(ctx, query)
 	case "postgresql":
-		cmd = fmt.Sprintf(
-			"sudo -u postgres psql -c \"CREATE USER %s WITH PASSWORD '%s'; GRANT ALL PRIVILEGES ON DATABASE %s TO %s;\"",
-			p.Username, p.Password, p.DBName, p.Username,
-		)
+		database, quoteErr := quotePostgresIdentifier(p.DBName)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		username, quoteErr := quotePostgresIdentifier(p.Username)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		password, quoteErr := quotePostgresString(p.Password)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		query := fmt.Sprintf("CREATE USER %s WITH PASSWORD %s; GRANT ALL PRIVILEGES ON DATABASE %s TO %s;", username, password, database, username)
+		output, exitCode, err = e.runPostgresQuery(ctx, query)
 	default:
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
 	}
-
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
 
 	log.Info().Str("username", p.Username).Str("database", p.DBName).Msg("Created database user")
 
@@ -1860,17 +2077,26 @@ func (e *Executor) handleDeleteDatabaseUser(ctx context.Context, payload json.Ra
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	var cmd string
+	var output string
+	var exitCode int
+	var err error
 	switch p.Type {
 	case "mysql", "mariadb":
-		cmd = fmt.Sprintf("mysql -e \"DROP USER IF EXISTS '%s'@'localhost'; DROP USER IF EXISTS '%s'@'%%'; FLUSH PRIVILEGES;\"", p.Username, p.Username)
+		username, quoteErr := quoteMySQLString(p.Username)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		output, exitCode, err = e.runMySQLQuery(ctx,
+			fmt.Sprintf("DROP USER IF EXISTS %s@'localhost'; DROP USER IF EXISTS %s@'%%'; FLUSH PRIVILEGES;", username, username))
 	case "postgresql":
-		cmd = fmt.Sprintf("sudo -u postgres psql -c \"DROP USER IF EXISTS %s;\"", p.Username)
+		username, quoteErr := quotePostgresIdentifier(p.Username)
+		if quoteErr != nil {
+			return comm.JobResult{Success: false, Error: quoteErr.Error()}
+		}
+		output, exitCode, err = e.runPostgresQuery(ctx, fmt.Sprintf("DROP USER IF EXISTS %s;", username))
 	default:
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
 	}
-
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
 
 	return comm.JobResult{
 		Success:  err == nil,
@@ -1892,26 +2118,36 @@ func (e *Executor) handleExportDatabase(ctx context.Context, payload json.RawMes
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	timestamp := strings.ReplaceAll(strings.ReplaceAll(strings.Split(fmt.Sprintf("%v", ctx.Value("timestamp")), ".")[0], "-", ""), " ", "_")
-	if timestamp == "" {
-		timestamp = "export"
+	if _, err := quotePostgresIdentifier(p.DBName); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
-	outputFile := fmt.Sprintf("/tmp/%s_%s.sql", p.DBName, timestamp)
+	exportRoot := "/opt/sitekit/tmp/exports"
+	if err := os.MkdirAll(exportRoot, 0700); err != nil {
+		return comm.JobResult{Success: false, Error: "failed to create export directory: " + err.Error()}
+	}
+	exportDir, err := os.MkdirTemp(exportRoot, "export-*")
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	outputFile := filepath.Join(exportDir, p.DBName+".sql")
+	outputHandle, err := os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
 
-	var cmd string
+	var output string
+	var exitCode int
 	switch p.Type {
 	case "mysql", "mariadb":
 		args := []string{}
-		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
-			args = append(args, "-u", e.mysqlConfig.User, "-p'"+e.mysqlConfig.Password+"'")
-		}
 		if !p.IncludeData {
 			args = append(args, "--no-data")
 		}
 		if !p.IncludeStructure {
 			args = append(args, "--no-create-info")
 		}
-		cmd = fmt.Sprintf("mysqldump %s %s > %s", strings.Join(args, " "), p.DBName, outputFile)
+		args = append(args, p.DBName)
+		output, exitCode, err = e.runMySQLProgram(ctx, "mysqldump", args, nil, outputHandle)
 	case "postgresql":
 		args := []string{}
 		if !p.IncludeData {
@@ -1920,21 +2156,25 @@ func (e *Executor) handleExportDatabase(ctx context.Context, payload json.RawMes
 		if !p.IncludeStructure {
 			args = append(args, "--data-only")
 		}
-		cmd = fmt.Sprintf("sudo -u postgres pg_dump %s %s > %s", strings.Join(args, " "), p.DBName, outputFile)
+		args = append(args, p.DBName)
+		output, exitCode, err = e.runPostgresProgram(ctx, "pg_dump", args, nil, outputHandle)
 	default:
+		outputHandle.Close()
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
 	}
-
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+	if closeErr := outputHandle.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return comm.JobResult{Success: false, Output: output, Error: errToString(err), ExitCode: exitCode}
 	}
 
 	if p.Compress {
-		_, _, gzErr := e.RunCommandWithExitCode(ctx, "gzip", "-f", outputFile)
-		if gzErr == nil {
-			outputFile = outputFile + ".gz"
+		_, _, err := e.RunCommandWithExitCode(ctx, "gzip", "-f", outputFile)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output, Error: "failed to compress export: " + err.Error(), ExitCode: exitCode}
 		}
+		outputFile += ".gz"
 	}
 
 	return comm.JobResult{
@@ -1956,42 +2196,57 @@ func (e *Executor) handleImportDatabase(ctx context.Context, payload json.RawMes
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Check if file is gzipped
-	importFile := p.FilePath
+	inputFile, err := openRegularFile(func() (*os.File, error) {
+		return os.OpenFile(p.FilePath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
+	if err != nil {
+		return comm.JobResult{Success: false, Error: "failed to open import file: " + err.Error()}
+	}
+	defer inputFile.Close()
+
+	var importReader io.Reader = inputFile
 	if strings.HasSuffix(p.FilePath, ".gz") {
-		unzippedFile := strings.TrimSuffix(p.FilePath, ".gz")
-		_, _, err := e.RunCommandWithExitCode(ctx, "gunzip", "-k", "-f", p.FilePath)
+		gzipReader, err := gzip.NewReader(inputFile)
 		if err != nil {
 			return comm.JobResult{Success: false, Error: "failed to decompress file"}
 		}
-		importFile = unzippedFile
+		defer gzipReader.Close()
+		importReader = gzipReader
 	}
 
-	var cmd string
 	switch p.Type {
 	case "mysql", "mariadb":
-		if p.DropExisting {
-			dropCmd := fmt.Sprintf("mysql -e \"DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;\"", p.DBName, p.DBName)
-			e.RunCommandWithExitCode(ctx, "bash", "-c", dropCmd)
+		database, err := quoteMySQLIdentifier(p.DBName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
 		}
-		cmd = fmt.Sprintf("mysql %s < %s", p.DBName, importFile)
+		if p.DropExisting {
+			_, _, err := e.runMySQLQuery(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;", database, database))
+			if err != nil {
+				return comm.JobResult{Success: false, Error: "failed to reset database: " + err.Error()}
+			}
+		}
+		output, exitCode, err := e.runMySQLProgram(ctx, mysqlProgram(), []string{p.DBName}, importReader, nil)
+		return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err), ExitCode: exitCode}
 	case "postgresql":
-		if p.DropExisting {
-			dropCmd := fmt.Sprintf("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;\"", p.DBName, p.DBName)
-			e.RunCommandWithExitCode(ctx, "bash", "-c", dropCmd)
+		database, err := quotePostgresIdentifier(p.DBName)
+		if err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
 		}
-		cmd = fmt.Sprintf("sudo -u postgres psql %s < %s", p.DBName, importFile)
+		if p.DropExisting {
+			_, _, err := e.runPostgresQuery(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;", database, database))
+			if err != nil {
+				return comm.JobResult{Success: false, Error: "failed to reset database: " + err.Error()}
+			}
+		}
+		output, exitCode, err := e.runPostgresProgram(
+			ctx, "psql",
+			[]string{"--set", "ON_ERROR_STOP=1", "--dbname", p.DBName},
+			importReader, nil,
+		)
+		return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err), ExitCode: exitCode}
 	default:
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
-	}
-
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
-
-	return comm.JobResult{
-		Success:  err == nil,
-		Output:   output,
-		Error:    errToString(err),
-		ExitCode: exitCode,
 	}
 }
 
@@ -2004,27 +2259,29 @@ func (e *Executor) handleOptimizeDatabase(ctx context.Context, payload json.RawM
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	var cmd string
 	switch p.Type {
 	case "mysql", "mariadb":
-		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
-			cmd = fmt.Sprintf("mysqlcheck -u %s -p'%s' --optimize %s", e.mysqlConfig.User, e.mysqlConfig.Password, p.DBName)
-		} else {
-			cmd = fmt.Sprintf("mysqlcheck --optimize %s", p.DBName)
+		if _, err := quoteMySQLIdentifier(p.DBName); err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
+		output, exitCode, err := e.runMySQLProgram(ctx, "mysqlcheck", []string{"--optimize", p.DBName}, nil, nil)
+		return comm.JobResult{
+			Success: err == nil, Output: output, Error: errToString(err), ExitCode: exitCode,
 		}
 	case "postgresql":
-		cmd = fmt.Sprintf("sudo -u postgres psql -d %s -c \"VACUUM ANALYZE;\"", p.DBName)
+		if _, err := quotePostgresIdentifier(p.DBName); err != nil {
+			return comm.JobResult{Success: false, Error: err.Error()}
+		}
+		output, exitCode, err := e.runPostgresProgram(
+			ctx, "psql",
+			[]string{"--set", "ON_ERROR_STOP=1", "--dbname", p.DBName},
+			strings.NewReader("VACUUM ANALYZE;\n"), nil,
+		)
+		return comm.JobResult{
+			Success: err == nil, Output: output, Error: errToString(err), ExitCode: exitCode,
+		}
 	default:
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.Type)}
-	}
-
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
-
-	return comm.JobResult{
-		Success:  err == nil,
-		Output:   output,
-		Error:    errToString(err),
-		ExitCode: exitCode,
 	}
 }
 
@@ -2041,14 +2298,19 @@ func (e *Executor) handleEnableFirewall(ctx context.Context, payload json.RawMes
 
 	// Set defaults
 	if p.DefaultIncoming != "" {
+		if p.DefaultIncoming != "allow" && p.DefaultIncoming != "deny" && p.DefaultIncoming != "reject" {
+			return comm.JobResult{Success: false, Error: "invalid incoming firewall default"}
+		}
 		e.RunCommandWithExitCode(ctx, "ufw", "default", p.DefaultIncoming, "incoming")
 	}
 	if p.DefaultOutgoing != "" {
+		if p.DefaultOutgoing != "allow" && p.DefaultOutgoing != "deny" && p.DefaultOutgoing != "reject" {
+			return comm.JobResult{Success: false, Error: "invalid outgoing firewall default"}
+		}
 		e.RunCommandWithExitCode(ctx, "ufw", "default", p.DefaultOutgoing, "outgoing")
 	}
 
-	// Enable UFW (non-interactive)
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", "echo 'y' | ufw enable")
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "ufw", "--force", "enable")
 
 	log.Info().Msg("Firewall enabled")
 
@@ -2069,7 +2331,11 @@ func (e *Executor) handleApplyFirewallRule(ctx context.Context, payload json.Raw
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", p.Command)
+	args, err := parseUFWCommand(p.Command)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "ufw", args...)
 
 	log.Info().Str("rule_id", p.RuleID).Str("command", p.Command).Msg("Applied firewall rule")
 
@@ -2091,7 +2357,11 @@ func (e *Executor) handleRevertFirewallRule(ctx context.Context, payload json.Ra
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", p.Command)
+	args, err := parseUFWCommand(p.Command)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	output, exitCode, err := e.RunCommandWithExitCode(ctx, "ufw", args...)
 
 	log.Info().Str("rule_id", p.RuleID).Str("reason", p.Reason).Msg("Reverted firewall rule")
 
@@ -2116,6 +2386,12 @@ func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMes
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	if err := validateBackupFilename(p.Filename); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if _, err := quotePostgresIdentifier(p.DatabaseName); err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
 
 	log.Info().
 		Str("backup_id", p.BackupID).
@@ -2131,22 +2407,33 @@ func (e *Executor) handleDatabaseBackup(ctx context.Context, payload json.RawMes
 
 	outputFile := filepath.Join(backupDir, p.Filename)
 	uncompressedFile := strings.TrimSuffix(outputFile, ".gz")
-
-	var cmd string
-	switch p.DatabaseType {
-	case "mysql", "mariadb":
-		if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
-			cmd = fmt.Sprintf("mysqldump -u %s -p'%s' --single-transaction --quick --lock-tables=false %s > %s", e.mysqlConfig.User, e.mysqlConfig.Password, p.DatabaseName, uncompressedFile)
-		} else {
-			cmd = fmt.Sprintf("mysqldump --single-transaction --quick --lock-tables=false %s > %s", p.DatabaseName, uncompressedFile)
-		}
-	case "postgresql":
-		cmd = fmt.Sprintf("sudo -u postgres pg_dump --format=plain %s > %s", p.DatabaseName, uncompressedFile)
-	default:
-		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.DatabaseType)}
+	backupHandle, err := os.OpenFile(uncompressedFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to create backup file: " + err.Error()}
 	}
 
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "bash", "-c", cmd)
+	var output string
+	var exitCode int
+	switch p.DatabaseType {
+	case "mysql", "mariadb":
+		output, exitCode, err = e.runMySQLProgram(
+			ctx, "mysqldump",
+			[]string{"--single-transaction", "--quick", "--lock-tables=false", p.DatabaseName},
+			nil, backupHandle,
+		)
+	case "postgresql":
+		output, exitCode, err = e.runPostgresProgram(
+			ctx, "pg_dump",
+			[]string{"--format=plain", p.DatabaseName},
+			nil, backupHandle,
+		)
+	default:
+		backupHandle.Close()
+		return comm.JobResult{Success: false, Error: fmt.Sprintf("unsupported database type: %s", p.DatabaseType)}
+	}
+	if closeErr := backupHandle.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return comm.JobResult{
 			Success:  false,
@@ -2402,9 +2689,9 @@ func (e *Executor) handleSupervisorRestart(ctx context.Context, payload json.Raw
 
 func (e *Executor) handleCreateApacheVhost(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		AppID       string `json:"app_id"`
-		Domain      string `json:"domain"`
-		Config      string `json:"config"`
+		AppID  string `json:"app_id"`
+		Domain string `json:"domain"`
+		Config string `json:"config"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -2519,19 +2806,20 @@ func (e *Executor) handleDeleteApacheVhost(ctx context.Context, payload json.Raw
 
 func (e *Executor) handleListDirectory(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		BasePath string `json:"base_path"` // Security: only allow operations within this path
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	entries, err := os.ReadDir(p.Path)
+	entries, err := fs.ReadDir(root.FS(), relative)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
@@ -2570,44 +2858,52 @@ func (e *Executor) handleListDirectory(ctx context.Context, payload json.RawMess
 
 func (e *Executor) handleReadFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		Path      string `json:"path"`
-		BasePath  string `json:"base_path"`
-		MaxBytes  int64  `json:"max_bytes"` // Limit file size to read
+		Username string `json:"username"`
+		Path     string `json:"path"`
+		MaxBytes int64  `json:"max_bytes"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	// Check file size first
-	info, err := os.Stat(p.Path)
+	info, err := root.Stat(relative)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	if info.IsDir() {
-		return comm.JobResult{Success: false, Error: "cannot read directory as file"}
+	if !info.Mode().IsRegular() {
+		return comm.JobResult{Success: false, Error: "path is not a regular file"}
 	}
 
 	maxBytes := p.MaxBytes
 	if maxBytes <= 0 {
-		maxBytes = 1024 * 1024 // Default 1MB limit
+		maxBytes = 1024 * 1024
+	}
+	if maxBytes > 10*1024*1024 {
+		maxBytes = 10 * 1024 * 1024
 	}
 
-	if info.Size() > maxBytes {
-		return comm.JobResult{
-			Success: false,
-			Error:   fmt.Sprintf("file too large: %d bytes (max: %d)", info.Size(), maxBytes),
-		}
-	}
-
-	content, err := os.ReadFile(p.Path)
+	file, err := root.Open(relative)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer file.Close()
+
+	content, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if int64(len(content)) > maxBytes {
+		return comm.JobResult{
+			Success: false,
+			Error:   fmt.Sprintf("file too large (max: %d bytes)", maxBytes),
+		}
 	}
 
 	return comm.JobResult{
@@ -2622,37 +2918,45 @@ func (e *Executor) handleReadFile(ctx context.Context, payload json.RawMessage) 
 
 func (e *Executor) handleWriteFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		BasePath string `json:"base_path"`
 		Content  string `json:"content"`
-		Mode     string `json:"mode"` // Optional: file mode as string e.g. "0644"
+		Mode     string `json:"mode"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer root.Close()
+
+	mode, err := parseFileMode(p.Mode, 0644)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Determine file mode
-	mode := os.FileMode(0644)
-	if p.Mode != "" {
-		var modeInt int
-		fmt.Sscanf(p.Mode, "%o", &modeInt)
-		mode = os.FileMode(modeInt)
-	}
-
-	// Create parent directories if needed
-	parentDir := filepath.Dir(p.Path)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
+	if err := root.MkdirAll(filepath.Dir(relative), 0755); err != nil {
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("failed to create parent directory: %v", err)}
 	}
 
-	// Write file
-	if err := os.WriteFile(p.Path, []byte(p.Content), mode); err != nil {
+	file, err := root.OpenFile(relative, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	_, writeErr := io.WriteString(file, p.Content)
+	chmodErr := file.Chmod(mode)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return comm.JobResult{Success: false, Error: writeErr.Error()}
+	}
+	if chmodErr != nil {
+		return comm.JobResult{Success: false, Error: chmodErr.Error()}
+	}
+	if closeErr != nil {
+		return comm.JobResult{Success: false, Error: closeErr.Error()}
 	}
 
 	log.Info().Str("path", p.Path).Int("size", len(p.Content)).Msg("File written")
@@ -2665,31 +2969,28 @@ func (e *Executor) handleWriteFile(ctx context.Context, payload json.RawMessage)
 
 func (e *Executor) handleDeleteFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username  string `json:"username"`
 		Path      string `json:"path"`
-		BasePath  string `json:"base_path"`
-		Recursive bool   `json:"recursive"` // For directories
+		Recursive bool   `json:"recursive"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	// Prevent deleting the base path itself
-	absPath, _ := filepath.Abs(p.Path)
-	absBase, _ := filepath.Abs(p.BasePath)
-	if absPath == absBase {
+	if relative == "." {
 		return comm.JobResult{Success: false, Error: "cannot delete the base directory"}
 	}
 
-	var err error
 	if p.Recursive {
-		err = os.RemoveAll(p.Path)
+		err = root.RemoveAll(relative)
 	} else {
-		err = os.Remove(p.Path)
+		err = root.Remove(relative)
 	}
 
 	if err != nil {
@@ -2706,27 +3007,26 @@ func (e *Executor) handleDeleteFile(ctx context.Context, payload json.RawMessage
 
 func (e *Executor) handleCreateDirectory(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		BasePath string `json:"base_path"`
 		Mode     string `json:"mode"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer root.Close()
+
+	mode, err := parseFileMode(p.Mode, 0755)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	mode := os.FileMode(0755)
-	if p.Mode != "" {
-		var modeInt int
-		fmt.Sscanf(p.Mode, "%o", &modeInt)
-		mode = os.FileMode(modeInt)
-	}
-
-	if err := os.MkdirAll(p.Path, mode); err != nil {
+	if err := root.MkdirAll(relative, mode); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -2740,20 +3040,25 @@ func (e *Executor) handleCreateDirectory(ctx context.Context, payload json.RawMe
 
 func (e *Executor) handleRenameFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		OldPath  string `json:"old_path"`
 		NewPath  string `json:"new_path"`
-		BasePath string `json:"base_path"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate both paths are within base path
-	if !isPathWithin(p.OldPath, p.BasePath) || !isPathWithin(p.NewPath, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, realHome, oldRelative, err := openUserPath(p.Username, p.OldPath)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	if err := os.Rename(p.OldPath, p.NewPath); err != nil {
+	newRelative, err := relativeToRoot(realHome, p.NewPath)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if err := root.Rename(oldRelative, newRelative); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -2767,19 +3072,20 @@ func (e *Executor) handleRenameFile(ctx context.Context, payload json.RawMessage
 
 func (e *Executor) handleGetFileInfo(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		BasePath string `json:"base_path"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	info, err := os.Stat(p.Path)
+	info, err := root.Stat(relative)
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
@@ -2804,8 +3110,8 @@ func (e *Executor) handleGetFileInfo(ctx context.Context, payload json.RawMessag
 
 func (e *Executor) handleChmodFile(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username  string `json:"username"`
 		Path      string `json:"path"`
-		BasePath  string `json:"base_path"`
 		Mode      string `json:"mode"`
 		Recursive bool   `json:"recursive"`
 	}
@@ -2813,25 +3119,31 @@ func (e *Executor) handleChmodFile(ctx context.Context, payload json.RawMessage)
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	var modeInt int
-	fmt.Sscanf(p.Mode, "%o", &modeInt)
-	mode := os.FileMode(modeInt)
+	mode, err := parseFileMode(p.Mode, 0)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
 
 	if p.Recursive {
-		output, _, err := e.RunCommandWithExitCode(ctx, "chmod", "-R", p.Mode, p.Path)
-		return comm.JobResult{
-			Success: err == nil,
-			Output:  output,
-			Error:   errToString(err),
-		}
+		err = fs.WalkDir(root.FS(), relative, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			return root.Chmod(path, mode)
+		})
+	} else {
+		err = root.Chmod(relative, mode)
 	}
-
-	if err := os.Chmod(p.Path, mode); err != nil {
+	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -2845,38 +3157,47 @@ func (e *Executor) handleChmodFile(ctx context.Context, payload json.RawMessage)
 
 func (e *Executor) handleListLogs(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		LogPath string `json:"log_path"` // Base directory for logs (e.g., /home/app/logs)
+		Username string `json:"username"`
+		LogPath  string `json:"log_path"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	type LogFile struct {
-		Name     string `json:"name"`
-		Path     string `json:"path"`
-		Size     int64  `json:"size"`
-		ModTime  string `json:"mod_time"`
+		Name    string `json:"name"`
+		Path    string `json:"path"`
+		Size    int64  `json:"size"`
+		ModTime string `json:"mod_time"`
 	}
 
 	var logs []LogFile
 
-	// Walk through log directory
-	err := filepath.Walk(p.LogPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip files we can't access
+	root, realHome, relative, err := openUserPath(p.Username, p.LogPath)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer root.Close()
+
+	err = fs.WalkDir(root.FS(), relative, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		if info.IsDir() {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 
-		// Only include common log file extensions
-		ext := strings.ToLower(filepath.Ext(info.Name()))
-		if ext == ".log" || ext == ".txt" || strings.HasSuffix(info.Name(), ".log.1") ||
-			strings.HasSuffix(info.Name(), ".log.2") || info.Name() == "error_log" ||
-			info.Name() == "access_log" {
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".log" || ext == ".txt" || strings.HasSuffix(entry.Name(), ".log.1") ||
+			strings.HasSuffix(entry.Name(), ".log.2") || entry.Name() == "error_log" ||
+			entry.Name() == "access_log" {
+			info, infoErr := entry.Info()
+			if infoErr != nil || !info.Mode().IsRegular() {
+				return infoErr
+			}
 			logs = append(logs, LogFile{
-				Name:    info.Name(),
-				Path:    path,
+				Name:    entry.Name(),
+				Path:    filepath.Join(realHome, path),
 				Size:    info.Size(),
 				ModTime: info.ModTime().Format("2006-01-02 15:04:05"),
 			})
@@ -2886,23 +3207,6 @@ func (e *Executor) handleListLogs(ctx context.Context, payload json.RawMessage) 
 
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
-	}
-
-	// Also check common system log locations for the app
-	systemLogs := []string{
-		fmt.Sprintf("/var/log/nginx/%s-access.log", filepath.Base(p.LogPath)),
-		fmt.Sprintf("/var/log/nginx/%s-error.log", filepath.Base(p.LogPath)),
-	}
-
-	for _, logPath := range systemLogs {
-		if info, err := os.Stat(logPath); err == nil && !info.IsDir() {
-			logs = append(logs, LogFile{
-				Name:    filepath.Base(logPath),
-				Path:    logPath,
-				Size:    info.Size(),
-				ModTime: info.ModTime().Format("2006-01-02 15:04:05"),
-			})
-		}
 	}
 
 	logsJSON, _ := json.Marshal(logs)
@@ -2916,9 +3220,10 @@ func (e *Executor) handleListLogs(ctx context.Context, payload json.RawMessage) 
 
 func (e *Executor) handleTailLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		Lines    int    `json:"lines"`     // Number of lines to tail (default 100)
-		Follow   bool   `json:"follow"`    // Not used in sync mode, but for future SSE support
+		Lines    int    `json:"lines"`
+		Follow   bool   `json:"follow"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -2932,22 +3237,30 @@ func (e *Executor) handleTailLog(ctx context.Context, payload json.RawMessage) c
 		lines = 1000 // Max 1000 lines
 	}
 
-	// Use tail command for efficiency
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "tail", "-n", fmt.Sprintf("%d", lines), p.Path)
-
-	return comm.JobResult{
-		Success:  err == nil,
-		Output:   output,
-		Error:    errToString(err),
-		ExitCode: exitCode,
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
+
+	file, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer file.Close()
+
+	output, err := tailLines(ctx, file, lines)
+	return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err)}
 }
 
 func (e *Executor) handleSearchLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
-		Path    string `json:"path"`
-		Pattern string `json:"pattern"`
-		Lines   int    `json:"lines"` // Max lines to return
+		Username string `json:"username"`
+		Path     string `json:"path"`
+		Pattern  string `json:"pattern"`
+		Lines    int    `json:"lines"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -2961,41 +3274,52 @@ func (e *Executor) handleSearchLog(ctx context.Context, payload json.RawMessage)
 		lines = 500
 	}
 
-	// Use grep for searching
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "grep", "-n", "-m", fmt.Sprintf("%d", lines), p.Pattern, p.Path)
-
-	// grep returns exit code 1 when no matches found - this is not an error
-	if exitCode == 1 && output == "" {
-		return comm.JobResult{
-			Success: true,
-			Output:  "No matches found",
-		}
+	expression, err := regexp.Compile(p.Pattern)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: "invalid search pattern: " + err.Error()}
 	}
 
-	return comm.JobResult{
-		Success:  err == nil || exitCode == 1,
-		Output:   output,
-		Error:    errToString(err),
-		ExitCode: exitCode,
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
+
+	file, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer file.Close()
+
+	output, err := searchLines(file, expression, lines)
+	if err == nil && output == "" {
+		output = "No matches found"
+	}
+	return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err)}
 }
 
 func (e *Executor) handleClearLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username string `json:"username"`
 		Path     string `json:"path"`
-		BasePath string `json:"base_path"` // Security: only allow operations within this path
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Security: validate path is within base path
-	if p.BasePath != "" && !isPathWithin(p.Path, p.BasePath) {
-		return comm.JobResult{Success: false, Error: "access denied: path outside allowed directory"}
+	root, _, relative, err := openUserPath(p.Username, p.Path)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	// Truncate the log file instead of deleting it
-	if err := os.Truncate(p.Path, 0); err != nil {
+	file, err := root.OpenFile(relative, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if err := file.Close(); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -3009,8 +3333,9 @@ func (e *Executor) handleClearLog(ctx context.Context, payload json.RawMessage) 
 
 func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessage) comm.JobResult {
 	var p struct {
+		Username   string `json:"username"`
 		Path       string `json:"path"`
-		OutputPath string `json:"output_path"` // Where to save the compressed log
+		OutputPath string `json:"output_path"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
@@ -3022,27 +3347,62 @@ func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessag
 		outputPath = p.Path + ".gz"
 	}
 
-	// Compress the log file
-	output, exitCode, err := e.RunCommandWithExitCode(ctx, "gzip", "-c", p.Path)
+	root, realHome, relative, err := openUserPath(p.Username, p.Path)
 	if err != nil {
-		return comm.JobResult{
-			Success:  false,
-			Output:   output,
-			Error:    err.Error(),
-			ExitCode: exitCode,
-		}
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
+	defer root.Close()
 
-	// Write compressed content
-	if err := os.WriteFile(outputPath, []byte(output), 0644); err != nil {
+	outputRelative, err := relativeToRoot(realHome, outputPath)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	input, err := openRegularFile(func() (*os.File, error) {
+		return root.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	})
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	// Get file size
-	info, _ := os.Stat(outputPath)
-	var size int64
-	if info != nil {
-		size = info.Size()
+	output, err := root.OpenFile(outputRelative, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	destinationInfo, err := output.Stat()
+	if err != nil {
+		output.Close()
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if os.SameFile(info, destinationInfo) {
+		output.Close()
+		return comm.JobResult{Success: false, Error: "output path must not refer to the input log"}
+	}
+	if err := output.Truncate(0); err != nil {
+		output.Close()
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	compressor := gzip.NewWriter(output)
+	_, copyErr := io.Copy(compressor, input)
+	gzipErr := compressor.Close()
+	outputErr := output.Close()
+	if copyErr != nil {
+		return comm.JobResult{Success: false, Error: copyErr.Error()}
+	}
+	if gzipErr != nil {
+		return comm.JobResult{Success: false, Error: gzipErr.Error()}
+	}
+	if outputErr != nil {
+		return comm.JobResult{Success: false, Error: outputErr.Error()}
+	}
+
+	outputInfo, err := root.Stat(outputRelative)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	return comm.JobResult{
@@ -3050,42 +3410,151 @@ func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessag
 		Output:  outputPath,
 		Data: map[string]interface{}{
 			"path":       outputPath,
-			"size_bytes": size,
+			"size_bytes": outputInfo.Size(),
 		},
 	}
 }
 
-// Helper function to check if a path is within a base path (prevent path traversal)
 func isPathWithin(path, basePath string) bool {
-	if basePath == "" {
-		return false
-	}
-
-	absPath, err := filepath.Abs(path)
+	root, realBase, err := openRoot(basePath)
 	if err != nil {
 		return false
 	}
+	defer root.Close()
 
-	absBase, err := filepath.Abs(basePath)
+	relative, err := relativeToRoot(realBase, path)
 	if err != nil {
 		return false
 	}
+	if relative == "." {
+		return true
+	}
 
-	// Clean and compare paths
-	absPath = filepath.Clean(absPath)
-	absBase = filepath.Clean(absBase)
-
-	// Path must start with base path
-	if !strings.HasPrefix(absPath, absBase) {
+	opened, err := root.Open(relative)
+	if err == nil {
+		opened.Close()
+		return true
+	}
+	if !os.IsNotExist(err) {
 		return false
 	}
 
-	// Ensure it's not just a prefix match (e.g., /home/user vs /home/username)
-	if len(absPath) > len(absBase) && absPath[len(absBase)] != filepath.Separator {
-		return false
+	parent := filepath.Dir(relative)
+	for parent != "." && parent != string(filepath.Separator) {
+		openedRoot, openErr := root.OpenRoot(parent)
+		if openErr == nil {
+			openedRoot.Close()
+			return true
+		}
+		if !os.IsNotExist(openErr) {
+			return false
+		}
+		parent = filepath.Dir(parent)
 	}
-
 	return true
+}
+
+func tailLines(ctx context.Context, file *os.File, lines int) (string, error) {
+	const blockSize = 32 * 1024
+
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	contentEnd := info.Size()
+	if contentEnd > 0 {
+		var lastByte [1]byte
+		if _, err := file.ReadAt(lastByte[:], contentEnd-1); err != nil {
+			return "", err
+		}
+		if lastByte[0] == '\n' {
+			contentEnd--
+		}
+	}
+
+	start := int64(0)
+	position := contentEnd
+	newlines := 0
+	for position > 0 && newlines < lines {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		size := int64(blockSize)
+		if position < size {
+			size = position
+		}
+		position -= size
+		block := make([]byte, int(size))
+		n, err := file.ReadAt(block, position)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if n != len(block) {
+			return "", io.ErrUnexpectedEOF
+		}
+		block = block[:n]
+		for i := len(block) - 1; i >= 0; i-- {
+			if block[i] == '\n' {
+				newlines++
+				if newlines == lines {
+					start = position + int64(i) + 1
+					break
+				}
+			}
+		}
+		if newlines == lines {
+			break
+		}
+	}
+
+	var output strings.Builder
+	for position := start; position < contentEnd; {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		size := int64(blockSize)
+		if contentEnd-position < size {
+			size = contentEnd - position
+		}
+		block := make([]byte, int(size))
+		n, err := file.ReadAt(block, position)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if n != len(block) {
+			return "", io.ErrUnexpectedEOF
+		}
+		if _, err := output.Write(block[:n]); err != nil {
+			return "", err
+		}
+		position += int64(n)
+	}
+	output.WriteByte('\n')
+	return output.String(), nil
+}
+
+func searchLines(reader io.Reader, expression *regexp.Regexp, limit int) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var output strings.Builder
+	lineNumber := 0
+	matches := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := scanner.Text()
+		if expression.MatchString(line) {
+			fmt.Fprintf(&output, "%d:%s\n", lineNumber, line)
+			matches++
+			if matches == limit {
+				break
+			}
+		}
+	}
+	return output.String(), scanner.Err()
 }
 
 // handleCheckServices checks the status of multiple services
@@ -3402,7 +3871,10 @@ func (e *Executor) handleServerRestore(ctx context.Context, payload json.RawMess
 		"/etc/apt/sources.list.d/redis.list",
 	}
 	for _, pattern := range ppaFiles {
-		e.RunCommand(ctx, "bash", "-c", fmt.Sprintf("rm -f %s 2>/dev/null", pattern))
+		matches, _ := filepath.Glob(pattern)
+		for _, match := range matches {
+			_ = os.Remove(match)
+		}
 	}
 	output.WriteString("PPAs removed\n")
 
@@ -3419,12 +3891,23 @@ func (e *Executor) handleServerRestore(ctx context.Context, payload json.RawMess
 	cleanupScript := `#!/bin/bash
 sleep 5
 rm -rf /opt/sitekit
+rm -f "$0"
 `
-	cleanupPath := "/tmp/sitekit-cleanup.sh"
-	if err := os.WriteFile(cleanupPath, []byte(cleanupScript), 0755); err == nil {
-		// Run cleanup script in background, detached from this process
-		e.RunCommand(ctx, "bash", "-c", fmt.Sprintf("nohup %s > /dev/null 2>&1 &", cleanupPath))
-		output.WriteString("Scheduled final cleanup\n")
+	cleanupFile, err := os.CreateTemp("/run", "sitekit-cleanup-*.sh")
+	if err == nil {
+		cleanupPath := cleanupFile.Name()
+		_, writeErr := cleanupFile.WriteString(cleanupScript)
+		chmodErr := cleanupFile.Chmod(0700)
+		closeErr := cleanupFile.Close()
+		if writeErr != nil || chmodErr != nil || closeErr != nil {
+			_ = os.Remove(cleanupPath)
+			output.WriteString("Warning: failed to prepare final cleanup\n")
+		} else if err := e.StartDetached(cleanupPath); err != nil {
+			_ = os.Remove(cleanupPath)
+			output.WriteString(fmt.Sprintf("Warning: failed to schedule final cleanup: %v\n", err))
+		} else {
+			output.WriteString("Scheduled final cleanup\n")
+		}
 	}
 
 	output.WriteString("\n=== Server restore complete ===\n")
@@ -3472,61 +3955,8 @@ func (e *Executor) handleTestDatabaseConnection(ctx context.Context, payload jso
 }
 
 func (e *Executor) testMySQLConnection(ctx context.Context, output *strings.Builder) comm.JobResult {
-	// Try to read sitekit credentials
-	configDir := "/opt/sitekit/config"
-	var password, user string
-
-	if data, err := os.ReadFile(configDir + "/.mysql_sitekit"); err == nil {
-		password = strings.TrimSpace(string(data))
-		user = "sitekit"
-	} else if data, err := os.ReadFile(configDir + "/.mysql8_sitekit"); err == nil {
-		password = strings.TrimSpace(string(data))
-		user = "sitekit"
-	}
-
-	if password == "" {
-		// Try socket auth
-		var cmd *exec.Cmd
-		if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
-			cmd = exec.CommandContext(ctx, "mariadb", "-e", "SELECT 'Connection OK' as status")
-		} else {
-			cmd = exec.CommandContext(ctx, "mysql", "-e", "SELECT 'Connection OK' as status")
-		}
-		out, err := cmd.CombinedOutput()
-		output.WriteString(string(out))
-
-		if err != nil {
-			return comm.JobResult{
-				Success: false,
-				Output:  output.String(),
-				Error:   "Connection failed: " + err.Error(),
-			}
-		}
-		output.WriteString("\nConnection successful (socket auth)\n")
-		return comm.JobResult{Success: true, Output: output.String()}
-	}
-
-	// Create temp defaults file
-	tmpFile, err := os.CreateTemp("", "mysql-test-*.cnf")
-	if err != nil {
-		return comm.JobResult{Success: false, Error: "Failed to create temp file"}
-	}
-	defer os.Remove(tmpFile.Name())
-
-	defaultsContent := fmt.Sprintf("[client]\nuser=%s\npassword=%s\n", user, password)
-	tmpFile.WriteString(defaultsContent)
-	tmpFile.Close()
-	os.Chmod(tmpFile.Name(), 0600)
-
-	// Run test query
-	var cmdName string
-	if _, err := os.Stat("/usr/bin/mariadb"); err == nil {
-		cmdName = "mariadb"
-	} else {
-		cmdName = "mysql"
-	}
-
-	out, _, err := e.RunCommandWithExitCode(ctx, cmdName, fmt.Sprintf("--defaults-extra-file=%s", tmpFile.Name()), "-e", "SELECT 'Connection OK' as status")
+	_, password := e.mysqlCredentials()
+	out, _, err := e.runMySQLQuery(ctx, "SELECT 'Connection OK' as status;")
 	output.WriteString(out)
 
 	if err != nil {
@@ -3537,7 +3967,11 @@ func (e *Executor) testMySQLConnection(ctx context.Context, output *strings.Buil
 		}
 	}
 
-	output.WriteString("\nConnection successful\n")
+	if password == "" {
+		output.WriteString("\nConnection successful (socket auth)\n")
+	} else {
+		output.WriteString("\nConnection successful\n")
+	}
 	return comm.JobResult{Success: true, Output: output.String()}
 }
 
@@ -3549,17 +3983,22 @@ func (e *Executor) testPostgreSQLConnection(ctx context.Context, output *strings
 		password = strings.TrimSpace(string(data))
 	}
 
-	var cmd *exec.Cmd
+	var out string
+	var err error
 	if password != "" {
-		cmd = exec.CommandContext(ctx, "psql", "-U", "sitekit", "-h", "localhost", "-c", "SELECT 'Connection OK' as status")
-		cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+		out, _, err = e.runCommandWithExitCode(
+			ctx,
+			"psql",
+			[]string{"-U", "sitekit", "-h", "localhost", "--set", "ON_ERROR_STOP=1"},
+			commandOptions{
+				env:   []string{"PGPASSWORD=" + password},
+				stdin: strings.NewReader("SELECT 'Connection OK' as status;\n"),
+			},
+		)
 	} else {
-		// Try peer auth
-		cmd = exec.CommandContext(ctx, "sudo", "-u", "postgres", "psql", "-c", "SELECT 'Connection OK' as status")
+		out, _, err = e.runPostgresQuery(ctx, "SELECT 'Connection OK' as status;")
 	}
-
-	out, err := cmd.CombinedOutput()
-	output.WriteString(string(out))
+	output.WriteString(out)
 
 	if err != nil {
 		return comm.JobResult{

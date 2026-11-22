@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -31,6 +33,13 @@ type Executor struct {
 	handlers       map[string]JobHandler
 	mysqlConfig    DatabaseConfig
 	postgresConfig DatabaseConfig
+}
+
+type commandOptions struct {
+	dir    string
+	env    []string
+	stdin  io.Reader
+	stdout io.Writer
 }
 
 func NewExecutor(timeout time.Duration, mysqlCfg, postgresCfg DatabaseConfig) *Executor {
@@ -60,23 +69,39 @@ func (e *Executor) Execute(ctx context.Context, jobType string, payload json.Raw
 
 // RunCommand executes a command with timeout and proper process group handling
 func (e *Executor) RunCommand(ctx context.Context, name string, args ...string) (string, error) {
+	return e.runCommand(ctx, name, args, commandOptions{})
+}
+
+func (e *Executor) runCommand(ctx context.Context, name string, args []string, options commandOptions) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.defaultTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = options.dir
+	cmd.Stdin = options.stdin
+	if len(options.env) > 0 {
+		cmd.Env = append(os.Environ(), options.env...)
+	}
 
 	// Set process group so we can kill all children
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	if options.stdout != nil {
+		cmd.Stdout = options.stdout
+	} else {
+		cmd.Stdout = &stdout
+	}
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 
 	output := stdout.String()
 	if stderr.Len() > 0 {
-		output += "\n" + stderr.String()
+		if output != "" {
+			output += "\n"
+		}
+		output += stderr.String()
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {
@@ -92,7 +117,11 @@ func (e *Executor) RunCommand(ctx context.Context, name string, args ...string) 
 
 // RunCommandWithExitCode runs a command and returns the exit code
 func (e *Executor) RunCommandWithExitCode(ctx context.Context, name string, args ...string) (string, int, error) {
-	output, err := e.RunCommand(ctx, name, args...)
+	return e.runCommandWithExitCode(ctx, name, args, commandOptions{})
+}
+
+func (e *Executor) runCommandWithExitCode(ctx context.Context, name string, args []string, options commandOptions) (string, int, error) {
+	output, err := e.runCommand(ctx, name, args, options)
 
 	exitCode := 0
 	if err != nil {
@@ -104,6 +133,23 @@ func (e *Executor) RunCommandWithExitCode(ctx context.Context, name string, args
 	}
 
 	return output, exitCode, err
+}
+
+func (e *Executor) StartDetached(name string, args ...string) error {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 func (e *Executor) RegisterHandlers() {
