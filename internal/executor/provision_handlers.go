@@ -96,7 +96,7 @@ APT::Periodic::AutocleanInterval "7";
 	output.WriteString("\n=== Installing Node.js and npm ===\n")
 	if _, err := os.Stat("/usr/bin/node"); os.IsNotExist(err) {
 		// Use the distribution's signed package repository.
-		nodeOut, _, nodeErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "nodejs")
+		nodeOut, _, nodeErr := e.RunCommandWithExitCode(ctx, "apt-get", "install", "-y", "-qq", "nodejs", "npm")
 		output.WriteString(nodeOut)
 		if nodeErr != nil {
 			output.WriteString(fmt.Sprintf("Warning: failed to install Node.js: %v\n", nodeErr))
