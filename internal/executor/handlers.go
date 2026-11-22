@@ -1476,12 +1476,16 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 			keyFile.Close()
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to write deploy key: " + err.Error()}
 		}
-		keyFile.Close()
-		if err := os.Chown(keyPath, uid, gid); err != nil {
+		if err := keyFile.Chown(uid, gid); err != nil {
+			keyFile.Close()
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to secure deploy key: " + err.Error()}
 		}
-		if err := os.Chmod(keyPath, 0600); err != nil {
+		if err := keyFile.Chmod(0600); err != nil {
+			keyFile.Close()
 			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to secure deploy key: " + err.Error()}
+		}
+		if err := keyFile.Close(); err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to close deploy key: " + err.Error()}
 		}
 	}
 
