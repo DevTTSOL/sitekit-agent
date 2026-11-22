@@ -1,0 +1,6 @@
+/dist/
+/bin/*
+!/bin/sentinel-linux-amd64
+!/bin/sentinel-linux-arm64
+/sentinel
+/sentinel-*
