@@ -3285,8 +3285,21 @@ func (e *Executor) handleDownloadLog(ctx context.Context, payload json.RawMessag
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
-	output, err := root.OpenFile(outputRelative, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	output, err := root.OpenFile(outputRelative, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	destinationInfo, err := output.Stat()
+	if err != nil {
+		output.Close()
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if os.SameFile(info, destinationInfo) {
+		output.Close()
+		return comm.JobResult{Success: false, Error: "output path must not refer to the input log"}
+	}
+	if err := output.Truncate(0); err != nil {
+		output.Close()
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 	compressor := gzip.NewWriter(output)
