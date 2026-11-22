@@ -3224,7 +3224,7 @@ func (e *Executor) handleTailLog(ctx context.Context, payload json.RawMessage) c
 	}
 	defer file.Close()
 
-	output, err := tailLines(file, lines)
+	output, err := tailLines(ctx, file, lines)
 	return comm.JobResult{Success: err == nil, Output: output, Error: errToString(err)}
 }
 
@@ -3427,26 +3427,87 @@ func isPathWithin(path, basePath string) bool {
 	return true
 }
 
-func tailLines(reader io.Reader, lines int) (string, error) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	buffer := make([]string, 0, lines)
-	index := 0
-	for scanner.Scan() {
-		if len(buffer) < lines {
-			buffer = append(buffer, scanner.Text())
-		} else {
-			buffer[index] = scanner.Text()
-			index = (index + 1) % lines
-		}
-	}
-	if err := scanner.Err(); err != nil {
+func tailLines(ctx context.Context, file *os.File, lines int) (string, error) {
+	const blockSize = 32 * 1024
+
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if len(buffer) == lines {
-		buffer = append(buffer[index:], buffer[:index]...)
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
 	}
-	return strings.Join(buffer, "\n") + "\n", nil
+
+	contentEnd := info.Size()
+	if contentEnd > 0 {
+		var lastByte [1]byte
+		if _, err := file.ReadAt(lastByte[:], contentEnd-1); err != nil {
+			return "", err
+		}
+		if lastByte[0] == '\n' {
+			contentEnd--
+		}
+	}
+
+	start := int64(0)
+	position := contentEnd
+	newlines := 0
+	for position > 0 && newlines < lines {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		size := int64(blockSize)
+		if position < size {
+			size = position
+		}
+		position -= size
+		block := make([]byte, int(size))
+		n, err := file.ReadAt(block, position)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if n != len(block) {
+			return "", io.ErrUnexpectedEOF
+		}
+		block = block[:n]
+		for i := len(block) - 1; i >= 0; i-- {
+			if block[i] == '\n' {
+				newlines++
+				if newlines == lines {
+					start = position + int64(i) + 1
+					break
+				}
+			}
+		}
+		if newlines == lines {
+			break
+		}
+	}
+
+	var output strings.Builder
+	for position := start; position < contentEnd; {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		size := int64(blockSize)
+		if contentEnd-position < size {
+			size = contentEnd - position
+		}
+		block := make([]byte, int(size))
+		n, err := file.ReadAt(block, position)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if n != len(block) {
+			return "", io.ErrUnexpectedEOF
+		}
+		if _, err := output.Write(block[:n]); err != nil {
+			return "", err
+		}
+		position += int64(n)
+	}
+	output.WriteByte('\n')
+	return output.String(), nil
 }
 
 func searchLines(reader io.Reader, expression *regexp.Regexp, limit int) (string, error) {
