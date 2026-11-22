@@ -3050,27 +3050,10 @@ func (e *Executor) handleChmodFile(ctx context.Context, payload json.RawMessage)
 			if entry.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
-			file, openErr := root.Open(path)
-			if openErr != nil {
-				return openErr
-			}
-			chmodErr := file.Chmod(mode)
-			closeErr := file.Close()
-			if chmodErr != nil {
-				return chmodErr
-			}
-			return closeErr
+			return root.Chmod(path, mode)
 		})
 	} else {
-		var file *os.File
-		file, err = root.Open(relative)
-		if err == nil {
-			err = file.Chmod(mode)
-			closeErr := file.Close()
-			if err == nil {
-				err = closeErr
-			}
-		}
+		err = root.Chmod(relative, mode)
 	}
 	if err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
