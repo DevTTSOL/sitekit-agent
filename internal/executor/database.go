@@ -12,7 +12,7 @@ import (
 var mysqlHostPattern = regexp.MustCompile(`^(?:localhost|%|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$`)
 
 func (e *Executor) mysqlCredentials() (string, string) {
-	if e.mysqlConfig.User != "" {
+	if e.mysqlConfig.User != "" && e.mysqlConfig.Password != "" {
 		return e.mysqlConfig.User, e.mysqlConfig.Password
 	}
 
