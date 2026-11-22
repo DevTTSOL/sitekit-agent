@@ -120,18 +120,18 @@ Restart=always
 RestartSec=5
 
 # Environment
-Environment=HOSTMAN_SAAS_URL=
-Environment=HOSTMAN_AGENT_TOKEN=
-Environment=HOSTMAN_SERVER_ID=
+Environment=SITEKIT_SAAS_URL=
+Environment=SITEKIT_AGENT_TOKEN=
+Environment=SITEKIT_SERVER_ID=
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 # Update service file with actual values
-sed -i "s|HOSTMAN_SAAS_URL=|HOSTMAN_SAAS_URL=$SAAS_URL|" /etc/systemd/system/hostman-agent.service
-sed -i "s|HOSTMAN_AGENT_TOKEN=|HOSTMAN_AGENT_TOKEN=$AGENT_TOKEN|" /etc/systemd/system/hostman-agent.service
-sed -i "s|HOSTMAN_SERVER_ID=|HOSTMAN_SERVER_ID=$SERVER_ID|" /etc/systemd/system/hostman-agent.service
+sed -i "s|SITEKIT_SAAS_URL=|SITEKIT_SAAS_URL=$SAAS_URL|" /etc/systemd/system/hostman-agent.service
+sed -i "s|SITEKIT_AGENT_TOKEN=|SITEKIT_AGENT_TOKEN=$AGENT_TOKEN|" /etc/systemd/system/hostman-agent.service
+sed -i "s|SITEKIT_SERVER_ID=|SITEKIT_SERVER_ID=$SERVER_ID|" /etc/systemd/system/hostman-agent.service
 
 systemctl daemon-reload
 systemctl enable hostman-agent
