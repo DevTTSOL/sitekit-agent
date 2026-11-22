@@ -1,8 +1,8 @@
-# Hostman Agent Configuration
-# Copy this file to /opt/hostman/agent.yaml
+# SiteKit Agent Configuration
+# Copy this file to /opt/sitekit/agent.yaml
 
 # SaaS API URL
-saas_url: https://hostman.example.com
+saas_url: https://sitekit.example.com
 
 # Agent authentication token (from server creation)
 agent_token: your-agent-token-here
@@ -11,7 +11,7 @@ agent_token: your-agent-token-here
 server_id: ""
 
 # WebSocket URL for real-time communication (optional)
-websocket_url: wss://ws.hostman.example.com
+websocket_url: wss://ws.sitekit.example.com
 
 # Job polling interval (fallback when WebSocket unavailable)
 poll_interval: 5s

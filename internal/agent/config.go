@@ -2,7 +2,10 @@ package agent
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -83,6 +86,48 @@ func LoadConfig() (*Config, error) {
 	if cfg.SaasURL == "" {
 		return nil, fmt.Errorf("saas_url is required")
 	}
+	if err := validateEndpointURL(cfg.SaasURL, "https", "http"); err != nil {
+		return nil, fmt.Errorf("invalid saas_url: %w", err)
+	}
+	if cfg.WebSocketURL != "" {
+		if err := validateEndpointURL(cfg.WebSocketURL, "wss", "ws"); err != nil {
+			return nil, fmt.Errorf("invalid websocket_url: %w", err)
+		}
+	}
+	cfg.SaasURL = strings.TrimRight(cfg.SaasURL, "/")
 
 	return &cfg, nil
+}
+
+func validateEndpointURL(rawURL, secureScheme, loopbackScheme string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse URL: %w", err)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("credentials in URL are not allowed")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("absolute URL with a host is required")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("query strings and fragments are not allowed")
+	}
+
+	if parsed.Scheme == secureScheme {
+		return nil
+	}
+	if parsed.Scheme != loopbackScheme {
+		return fmt.Errorf("%s is required", secureScheme)
+	}
+
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if hostname == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(hostname)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("%s is required outside loopback development endpoints", secureScheme)
+	}
+	return nil
 }

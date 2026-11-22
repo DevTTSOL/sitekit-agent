@@ -24,28 +24,26 @@ The agent is automatically installed when you provision a server through the Sit
 
 ## Manual Installation
 
+Run the installer from a verified checkout and supply an independently obtained
+SHA-256 checksum for the exact release. Do not use a checksum fetched from the
+same unverified origin as the only authenticity check.
+
 ```bash
-# Download the agent binary
 VERSION=vX.Y.Z
-RELEASE=https://github.com/DevTTSOL/sitekit-agent/releases/download
-curl -fsSL "$RELEASE/$VERSION/sentinel-linux-amd64" -o /tmp/sentinel-linux-amd64
-curl -fsSL "$RELEASE/$VERSION/SHA256SUMS" -o /tmp/SHA256SUMS
-(cd /tmp && grep ' sentinel-linux-amd64$' SHA256SUMS | sha256sum -c -)
-install -m 755 /tmp/sentinel-linux-amd64 /opt/sitekit/bin/sentinel
+EXPECTED_SHA256=the-checksum-from-a-trusted-channel
 
-# Configure the agent
-cat > /opt/sitekit/agent.yaml << EOF
-server_id: "your-server-id"
-saas_url: "https://your-sitekit-instance.com"
-agent_token: "your-agent-token"
-poll_interval: "5s"
-stats_interval: "60s"
-log_level: "info"
-EOF
-
-# Start the agent
-systemctl start sitekit-agent
+sudo env \
+  AGENT_VERSION="$VERSION" \
+  AGENT_SHA256="$EXPECTED_SHA256" \
+  ./scripts/install.sh \
+  "your-agent-token" \
+  "https://your-sitekit-instance.com" \
+  "your-server-id"
 ```
+
+The installer downloads into a root-owned temporary directory, verifies the
+binary before installation, and keeps both `/opt/sitekit` and the systemd
+service file root-owned.
 
 ## Building from Source
 
@@ -91,6 +89,11 @@ The agent reads configuration from `/opt/sitekit/agent.yaml`:
 | `poll_interval` | Job polling interval | `5s` |
 | `stats_interval` | Stats reporting interval | `60s` |
 | `log_level` | Logging level (debug, info, warn, error) | `info` |
+
+`saas_url` must use HTTPS except for an explicit loopback development endpoint.
+SSH deployments require a trusted `ssh_known_hosts` entry and a full commit
+hash. File and log jobs must identify the managed `username`; a caller-supplied
+`base_path` is not treated as an authorization boundary.
 
 ## Developed By
 
