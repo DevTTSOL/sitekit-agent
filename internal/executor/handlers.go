@@ -1305,11 +1305,12 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 	if len(releaseHash) > 12 {
 		releaseHash = releaseHash[:12]
 	}
-	releaseDir := filepath.Join(p.AppPath, "releases", releaseHash)
-
-	// Check if release exists
-	if _, err := os.Stat(releaseDir); os.IsNotExist(err) {
+	releaseDir, err := findReleaseForRollback(filepath.Join(p.AppPath, "releases"), releaseHash)
+	if os.IsNotExist(err) {
 		return comm.JobResult{Success: false, Error: fmt.Sprintf("release %s not found", releaseHash)}
+	}
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
 	// Atomic symlink swap
@@ -1330,6 +1331,33 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 		Success: true,
 		Output:  fmt.Sprintf("Rolled back to release %s", releaseHash),
 	}
+}
+
+func findReleaseForRollback(releasesDir, releaseHash string) (string, error) {
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return "", err
+	}
+
+	var releasePath string
+	var latestModTime int64
+	for _, entry := range entries {
+		if !entry.IsDir() || (entry.Name() != releaseHash && !strings.HasPrefix(entry.Name(), releaseHash+"-")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if releasePath == "" || info.ModTime().UnixNano() > latestModTime {
+			releasePath = filepath.Join(releasesDir, entry.Name())
+			latestModTime = info.ModTime().UnixNano()
+		}
+	}
+	if releasePath == "" {
+		return "", os.ErrNotExist
+	}
+	return releasePath, nil
 }
 
 // Cleanup old releases
@@ -1454,7 +1482,6 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 	releasesDir := filepath.Join(p.AppPath, "releases")
 	sharedDir := filepath.Join(p.AppPath, "shared")
 	releaseName := strings.ToLower(p.CommitHash[:12])
-	releaseDir := filepath.Join(releasesDir, releaseName)
 	for _, dir := range []string{releasesDir, sharedDir} {
 		if out, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", dir); err != nil {
 			return comm.JobResult{Success: false, Output: out, Error: "Failed to prepare deployment directory: " + err.Error()}
@@ -1540,9 +1567,24 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 		cloneEnvironment = []string{"GIT_SSH_COMMAND=" + sshCommand(deployKeyPath, knownHostsPath)}
 	}
 
-	if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-rf", releaseDir); err != nil {
-		return comm.JobResult{Success: false, Error: "Failed to replace release directory: " + err.Error()}
+	stagingOutput, _, err := e.runCommandAsUser(
+		ctx, p.Username, p.AppPath, nil, "mktemp", "-d", "--", filepath.Join(releasesDir, releaseName+"-XXXXXX"),
+	)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to stage release: " + err.Error()}
 	}
+	releaseDir := filepath.Clean(strings.TrimSpace(stagingOutput))
+	if filepath.Dir(releaseDir) != filepath.Clean(releasesDir) ||
+		!strings.HasPrefix(filepath.Base(releaseDir), releaseName+"-") {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to stage release: invalid staging directory"}
+	}
+	activated := false
+	defer func() {
+		if !activated {
+			e.runCommandAsUser(context.Background(), p.Username, p.AppPath, nil, "rm", "-rf", releaseDir)
+		}
+	}()
+
 	output.WriteString(fmt.Sprintf("Cloning %s (branch: %s)...\n", p.Repository, p.Branch))
 	out, _, err := e.runCommandAsUser(
 		ctx, p.Username, p.AppPath, cloneEnvironment,
@@ -1709,6 +1751,7 @@ export HOME="$SITEKIT_HOME"
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to activate release: " + err.Error()}
 	}
 
+	activated = true
 	output.WriteString("Release activated\n")
 
 	if p.PostDeployScript != "" {
