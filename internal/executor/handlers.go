@@ -1319,7 +1319,11 @@ func (e *Executor) handleRollbackDeployment(ctx context.Context, payload json.Ra
 	tempLink := filepath.Join(p.AppPath, ".current.tmp")
 
 	os.Remove(tempLink)
-	if err := os.Symlink(releaseDir, tempLink); err != nil {
+	relativeReleaseTarget, err := relativeSymlinkTarget(tempLink, releaseDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Error: err.Error()}
+	}
+	if err := os.Symlink(relativeReleaseTarget, tempLink); err != nil {
 		return comm.JobResult{Success: false, Error: err.Error()}
 	}
 
@@ -1488,6 +1492,13 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 			return comm.JobResult{Success: false, Output: out, Error: "Failed to prepare deployment directory: " + err.Error()}
 		}
 	}
+	sharedPaths := append(append([]string{}, p.SharedDirectories...), p.SharedFiles...)
+	if p.CacheNodeModules && p.AppType == "nodejs" {
+		sharedPaths = append(sharedPaths, "node_modules")
+	}
+	if err := migrateDeploymentSymlinks(p.AppPath, sharedPaths); err != nil {
+		return comm.JobResult{Success: false, Error: "Failed to migrate deployment symlinks: " + err.Error()}
+	}
 
 	cloneEnvironment := []string{}
 	knownHostsPath := "/opt/sitekit/config/ssh_known_hosts"
@@ -1618,7 +1629,11 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 
 		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", filepath.Dir(releasePath))
 
-		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", sharedPath, releasePath); err != nil {
+		relativeTarget, err := relativeSymlinkTarget(releasePath, sharedPath)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared directory: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, releasePath); err != nil {
 			log.Warn().Err(err).Str("dir", dir).Msg("Failed to symlink shared directory")
 		} else {
 			output.WriteString(fmt.Sprintf("Linked shared directory: %s\n", dir))
@@ -1639,7 +1654,11 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 
 		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-f", releasePath)
 		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "mkdir", "-p", filepath.Dir(releasePath))
-		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", sharedPath, releasePath); err != nil {
+		relativeTarget, err := relativeSymlinkTarget(releasePath, sharedPath)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared file: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, releasePath); err != nil {
 			log.Warn().Err(err).Str("file", file).Msg("Failed to symlink shared file")
 		} else {
 			output.WriteString(fmt.Sprintf("Linked shared file: %s\n", file))
@@ -1658,7 +1677,11 @@ func (e *Executor) handleDeploy(ctx context.Context, payload json.RawMessage) co
 
 		e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-rf", nodeModulesRelease)
 
-		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", nodeModulesShared, nodeModulesRelease); err != nil {
+		relativeTarget, err := relativeSymlinkTarget(nodeModulesRelease, nodeModulesShared)
+		if err != nil {
+			return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve shared node_modules: " + err.Error()}
+		}
+		if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeTarget, nodeModulesRelease); err != nil {
 			log.Warn().Err(err).Msg("Failed to symlink node_modules")
 			output.WriteString(fmt.Sprintf("Warning: Failed to symlink node_modules: %v\n", err))
 		} else {
@@ -1743,7 +1766,11 @@ export HOME="$SITEKIT_HOME"
 	}
 
 	e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "rm", "-f", tempLink)
-	if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", releaseDir, tempLink); err != nil {
+	relativeReleaseTarget, err := relativeSymlinkTarget(tempLink, releaseDir)
+	if err != nil {
+		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to resolve release symlink: " + err.Error()}
+	}
+	if _, _, err := e.runCommandAsUser(ctx, p.Username, p.AppPath, nil, "ln", "-s", relativeReleaseTarget, tempLink); err != nil {
 		return comm.JobResult{Success: false, Output: output.String(), Error: "Failed to create symlink: " + err.Error()}
 	}
 

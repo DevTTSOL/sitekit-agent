@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -102,6 +103,133 @@ func relativeToRoot(rootPath, path string) (string, error) {
 		return "", fmt.Errorf("access denied: path outside allowed directory")
 	}
 	return relative, nil
+}
+
+func relativeSymlinkTarget(linkPath, targetPath string) (string, error) {
+	target, err := filepath.Rel(filepath.Dir(linkPath), targetPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlink target: %w", err)
+	}
+	return target, nil
+}
+
+func replaceSymlinkTarget(root *os.Root, linkPath, target string) error {
+	for range 10 {
+		random := make([]byte, 12)
+		if _, err := rand.Read(random); err != nil {
+			return err
+		}
+		tempPath := filepath.Join(filepath.Dir(linkPath), ".sitekit-link-"+hex.EncodeToString(random))
+		if err := root.Symlink(target, tempPath); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := root.Rename(tempPath, linkPath); err != nil {
+			root.Remove(tempPath)
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("failed to create a unique temporary symlink")
+}
+
+func migrateDeploymentSymlinks(appPath string, sharedPaths []string) error {
+	root, realAppPath, err := openRoot(appPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	currentInfo, err := root.Lstat("current")
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil && currentInfo.Mode()&os.ModeSymlink != 0 {
+		target, err := root.Readlink("current")
+		if err != nil {
+			return err
+		}
+		if filepath.IsAbs(target) {
+			target = filepath.Clean(target)
+			if _, err := relativeToRoot(filepath.Join(realAppPath, "releases"), target); err == nil {
+				relativeTarget, err := relativeSymlinkTarget(filepath.Join(realAppPath, "current"), target)
+				if err != nil {
+					return err
+				}
+				if err := replaceSymlinkTarget(root, "current", relativeTarget); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	releases, err := root.Open("releases")
+	if err != nil {
+		return err
+	}
+	defer releases.Close()
+	entries, err := releases.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+
+	cleanSharedPaths := make([]string, 0, len(sharedPaths))
+	for _, path := range sharedPaths {
+		if filepath.IsAbs(path) {
+			continue
+		}
+		path = filepath.Clean(path)
+		if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+			continue
+		}
+		cleanSharedPaths = append(cleanSharedPaths, path)
+	}
+	sort.Slice(cleanSharedPaths, func(i, j int) bool {
+		return strings.Count(cleanSharedPaths[i], string(filepath.Separator)) <
+			strings.Count(cleanSharedPaths[j], string(filepath.Separator))
+	})
+
+	sharedRoot := filepath.Join(realAppPath, "shared")
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		for _, sharedPath := range cleanSharedPaths {
+			linkPath := filepath.Join("releases", entry.Name(), sharedPath)
+			info, err := root.Lstat(linkPath)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				continue
+			}
+			target, err := root.Readlink(linkPath)
+			if err != nil {
+				return err
+			}
+			if !filepath.IsAbs(target) {
+				continue
+			}
+			target = filepath.Clean(target)
+			if _, err := relativeToRoot(sharedRoot, target); err != nil {
+				continue
+			}
+			absoluteLinkPath := filepath.Join(realAppPath, linkPath)
+			relativeTarget, err := relativeSymlinkTarget(absoluteLinkPath, target)
+			if err != nil {
+				return err
+			}
+			if err := replaceSymlinkTarget(root, linkPath, relativeTarget); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func openUserPath(username, path string) (*os.Root, string, string, error) {

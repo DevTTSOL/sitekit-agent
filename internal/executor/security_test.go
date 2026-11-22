@@ -56,6 +56,70 @@ func TestConfinedRootRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestMigrateDeploymentSymlinks(t *testing.T) {
+	appPath := t.TempDir()
+	releasePath := filepath.Join(appPath, "releases", "legacy")
+	sharedPath := filepath.Join(appPath, "shared")
+	for _, path := range []string{
+		releasePath,
+		sharedPath,
+		filepath.Join(sharedPath, "storage"),
+		filepath.Join(sharedPath, "node_modules"),
+	} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sharedPath, ".env"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(releasePath, filepath.Join(appPath, "current")); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"storage", "node_modules"} {
+		if err := os.Symlink(filepath.Join(sharedPath, path), filepath.Join(releasePath, path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(sharedPath, ".env"), filepath.Join(releasePath, ".env")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateDeploymentSymlinks(appPath, []string{"storage", "node_modules", ".env"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		link   string
+		target string
+	}{
+		{filepath.Join(appPath, "current"), releasePath},
+		{filepath.Join(releasePath, "storage"), filepath.Join(sharedPath, "storage")},
+		{filepath.Join(releasePath, "node_modules"), filepath.Join(sharedPath, "node_modules")},
+		{filepath.Join(releasePath, ".env"), filepath.Join(sharedPath, ".env")},
+	} {
+		target, err := os.Readlink(test.link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if filepath.IsAbs(target) || filepath.Clean(filepath.Join(filepath.Dir(test.link), target)) != test.target {
+			t.Errorf("symlink %q has target %q, want relative path to %q", test.link, target, test.target)
+		}
+	}
+
+	root, _, err := openRoot(appPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if content, err := root.ReadFile(filepath.Join("current", ".env")); err != nil || string(content) != "secret" {
+		t.Fatalf("confined root could not access migrated shared file: %q, %v", content, err)
+	}
+	if info, err := root.Stat(filepath.Join("current", "storage")); err != nil || !info.IsDir() {
+		t.Fatalf("confined root could not access migrated shared directory: %v", err)
+	}
+}
+
 func TestParseUFWCommandRejectsShellSyntax(t *testing.T) {
 	valid := []string{
 		"ufw allow 22/tcp",
