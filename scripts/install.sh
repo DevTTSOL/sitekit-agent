@@ -47,7 +47,7 @@ fi
 log "Updating package lists..."
 apt-get update -qq
 
-for pkg in curl ca-certificates git unzip ufw fail2ban; do
+for pkg in curl ca-certificates git unzip ufw fail2ban sudo; do
     if is_installed "$pkg"; then
         log "$pkg already installed, skipping"
     else
